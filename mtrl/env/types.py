@@ -5,7 +5,7 @@
 from typing import Dict, Union
 
 import numpy as np
-from gym.vector.async_vector_env import AsyncVectorEnv
+from gymnasium.vector.async_vector_env import AsyncVectorEnv  # gym shim
 
 from mtrl.utils.types import TensorType
 

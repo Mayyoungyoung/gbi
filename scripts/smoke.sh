@@ -16,6 +16,10 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# 23 核 cgroup 配额限制: spawn worker 未受限时 torch/OpenBLAS 每进程开 192 线程,
+# 20 个 worker 会线程空转导致步速坍塌 (~4 it/s)。单线程化 env worker 后恢复正常。
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+
 SMOKE_STEPS=15000
 EVAL_FREQ=5000
 
