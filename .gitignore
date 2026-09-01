@@ -1,3 +1,6 @@
 logs/
 outputs/
 __pycache__/
+*.pyc
+tmp_obs_check.py
+*.log

@@ -33,6 +33,8 @@ else
     exit 1
 fi
 
+fix_or_random=${fix_or_random:-False}
+
 if [ "$fix_or_random" == "rand" ]; then
     env_random_goal="True"
 else

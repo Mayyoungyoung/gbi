@@ -9,11 +9,11 @@ defaults:
   - agent/components: guide_critic
   - agent/components: guide_encoder
   - agent/components: transition_model
+  - agent/components: world_model
   # - agent/components: task_to_encoder_cluster
   - agent/components: mask
   - agent/components: multitask
   - agent/components: guide_multitask
-  - agent/components: transition_model
   - agent/components: task_to_encoder_cluster
   - agent/optimizers: actor
   - agent/optimizers: alpha

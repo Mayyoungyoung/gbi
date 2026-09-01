@@ -1,0 +1,60 @@
+# @package _group_
+name: gbi_sac
+
+# 注意（L7 可读性陷阱）：identity encoder 下此值在运行时被 experiment.prepare_config()
+# 强制覆盖为 env obs 维度（MT10=39），此处 50 仅是非 identity encoder 的占位缺省；
+# actor 的 MLP 输入维度经 encoder.yaml 的 ${agent.encoder_feature_dim} 惰性插值取值。
+# 离线 hydra compose 验证 shape 时必须复现该覆盖，否则会误报尺寸不匹配。
+encoder_feature_dim: 50
+num_layers: 0
+num_filters: 0
+
+# ---- GbI 裁决配置（mtrl.agent.gbi_sac.Agent 的 gbi_cfg 输入） ----
+gbi:
+  enabled: True
+  # 裁决公式: gbi = Q 锚 + λ_t·(Î_j−Î_i)；qmp = λ≡0 消融基线；imag = 纯想象
+  arbiter_mode: gbi
+  # 触发: adaptive = U_score 自适应；fixed_K = 固定步频；always = 每步
+  trigger_mode: adaptive
+  H: 5
+  gamma: 0.99
+  W: 10000
+  rho_on: 0.9
+  rho_reject: 0.99
+  tau_off_ratio: 0.7
+  K_min: 3
+  K_max: 15
+  m_low: 3
+  fixed_K: 10
+  calibrate_window: 500
+  # 世界模型训练 + TTA
+  wm_update_every: 1
+  wm_batch_size: 1024
+  tta_enabled: True
+  tta_recent_n: 5
+  # 候选快照池（Phase 0/M3：state_sac 训练快照的 model_dir 与 step 列表）
+  candidates_dir: null
+  candidate_steps: []
+  source_log_dump_every: 10000
+
+builder:
+  _target_: mtrl.agent.gbi_sac.Agent
+  # obs_shape
+  # action_shape
+  # device
+  actor_cfg: ${agent.actor}
+  critic_cfg: ${agent.critic}
+  multitask_cfg: ${agent.multitask}
+  alpha_optimizer_cfg: ${agent.optimizers.alpha}
+  actor_optimizer_cfg: ${agent.optimizers.actor}
+  critic_optimizer_cfg: ${agent.optimizers.critic}
+  discount: 0.99
+  init_temperature: 1.0
+  actor_update_freq: 1
+  critic_tau: 0.01
+  critic_target_update_freq: 1
+  encoder_tau: 0.05
+  loss_reduction: alpha_weight
+  # GbI 新增
+  gbi_cfg: ${agent.gbi}
+  world_model_cfg: ${agent.components.world_model}

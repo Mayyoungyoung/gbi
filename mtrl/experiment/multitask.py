@@ -252,6 +252,12 @@ class Experiment(experiment.Experiment):
 
             multitask_obs = next_multitask_obs
             # episode_step += 1
+
+        # 训练结束：final 归档来源标记（M3 修复：尾部不足 dump_every 的记录
+        # 此前永远不会落盘；仅 GbI agent 有该方法，其余 agent 跳过）
+        if hasattr(self.agent, "_dump_source_log"):
+            self.agent._dump_source_log(final=True)
+
         self.replay_buffer.delete_from_filesystem(self.buffer_dir)
         self.close_envs()
 

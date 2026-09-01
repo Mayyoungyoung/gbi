@@ -23,6 +23,17 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_TH
 SMOKE_STEPS=15000
 EVAL_FREQ=5000
 
+# GbI 裁决器/world model 专属 metric 在 mtrl_gbi 中登记
+METRICS=mtrl
+AGENT_CFG="$ALG"
+if [ "$ALG" == "gbi" ] || [ "$ALG" == "gbi_sac" ]; then
+    METRICS=mtrl_gbi
+    AGENT_CFG=gbi_sac
+elif [ "$ALG" == "qmp" ]; then
+    METRICS=mtrl_gbi
+    AGENT_CFG=gbi_sac
+fi
+
 if [ "$ENV" == "metaworld" ] && [ "$MAP" == "mt10" ]; then
     ENV_NAME="metaworld-mt10"
     RB_CAPACITY=20000
@@ -42,8 +53,8 @@ cmd=(
   "setup.id=smoke_${ALG}_${MAP}_s0"
   "setup.seed=0"
   "env=$ENV_NAME"
-  "agent=$ALG"
-  "metrics=mtrl"
+  "agent=$AGENT_CFG"
+  "metrics=$METRICS"
   "experiment.name=$ENV"
   "experiment.num_train_steps=$SMOKE_STEPS"
   "experiment.eval_freq=$EVAL_FREQ"
@@ -51,6 +62,11 @@ cmd=(
   "replay_buffer.capacity=$RB_CAPACITY"
   "replay_buffer.batch_size=$RB_BATCH"
 )
+
+# QMP 冒烟：裁决公式 λ≡0 + 每步重判
+if [ "$ALG" == "qmp" ]; then
+    cmd+=( "agent.gbi.arbiter_mode=qmp" "agent.gbi.trigger_mode=always" )
+fi
 
 echo "[smoke] launching: ${cmd[*]}"
 PYTHONPATH=. "${cmd[@]}" 2>&1 | tee "/root/rivermind-data/lost+found/gbi/smoke_${ALG}_${MAP}.log"

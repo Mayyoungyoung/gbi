@@ -92,10 +92,6 @@ class Experiment(checkpointable.Checkpointable):
 
         should_resume_experiment = self.config.experiment.should_resume
 
-        if should_resume_experiment:
-            self.start_step = self.agent.load_latest_step(model_dir=self.model_dir)
-            self.replay_buffer.load(save_dir=self.buffer_dir)
-            
         self.logger = Logger(
             self.config.setup.save_dir,
             config=self.config,
@@ -113,6 +109,12 @@ class Experiment(checkpointable.Checkpointable):
             device=self.device,
             logger=self.logger,
         )
+
+        # resume 必须在 agent 创建之后（M5 修复：原实现先调
+        # self.agent.load_latest_step 再创建 agent，should_resume=True 时必崩）
+        if should_resume_experiment:
+            self.start_step = self.agent.load_latest_step(model_dir=self.model_dir)
+            self.replay_buffer.load(save_dir=self.buffer_dir)
 
         self.max_episode_steps = self.env_metadata[
             "max_episode_steps"

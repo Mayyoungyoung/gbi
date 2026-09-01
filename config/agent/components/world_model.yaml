@@ -1,0 +1,21 @@
+# @package agent.components.world_model
+# GbI 世界模型配置（state-based RSSM 简化版 + 5 任务条件 two-hot 奖励头）
+_target_: mtrl.agent.components.world_model.WorldModel
+hidden_dim: 512
+num_heads: 5
+reward_bins: 101
+reward_min: -400.0
+reward_max: 400.0
+encoder_ema_tau: 0.995
+lr: 1e-4
+adapt_lr: 1e-5
+adapt_scope: last_layer
+grad_clip: 10.0
+reward_weight: 1.0
+obs_weight: 1.0
+state_weight: 1.0
+cache_size: 4096
+cache_refresh_every: 512
+residual_quantile: 0.8
+residual_temperature: 5.0
+residual_max_weight: 5.0
