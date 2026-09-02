@@ -222,10 +222,12 @@ if [ "$1" = "--one" ]; then
 fi
 
 if [ "${PARALLEL:-0}" = "1" ]; then
-    # 并行模式（2026-09-02）：10 个 stage 无相互依赖（候选池固定为 seed0 快照），
-    # 实测单进程显存 <1GB（qmp）、GPU 利用率 ~40%（瓶颈在 CPU 环境交互），
-    # 单卡 T4 15GB + 96 核 CPU 可安全并行；MAX_PARALLEL 控制并发（建议 4-6）
-    MAX_PARALLEL="${MAX_PARALLEL:-4}"
+    # 并行模式（2026-09-02 实测校准）：10 个 stage 无相互依赖（候选池固定为
+    # seed0 快照），可任意并发。资源实测（10 vCPU + T4 16GB）：单进程显存
+    # <1GB（qmp 493MiB），3 并发即 GPU 100%（总吞吐 ~21 步/秒 ≈ 单进程 2.2×），
+    # 各任务步速仅退化 ~10%。推荐 MAX_PARALLEL=3（保守）~4（含轻任务多时）；
+    # 并发 >5 无收益（GPU 已是瓶颈，只会摊薄每进程速度）。
+    MAX_PARALLEL="${MAX_PARALLEL:-3}"
     log "并行模式启动（并发=$MAX_PARALLEL）: $STAGES"
     echo "$STAGES" | tr ' ' '\n' | grep -v '^$' | \
         xargs -P "$MAX_PARALLEL" -I{} bash "$0" --one {}
