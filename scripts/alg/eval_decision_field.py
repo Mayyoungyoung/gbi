@@ -129,7 +129,10 @@ def main():
         path = os.path.join(args.model_dir, f"actor_{step}.pt")
         sd = torch.load(path, map_location=device)
         print(f"== ckpt {step}: {path} ==", flush=True)
-        succ, rew = eval_ckpt(sd, task_names, tasks, args.eps, device, seed0=100 + step)
+        # 跨模型必须共享同一初始状态分布（同 seed），否则比较无效——
+        # 早期版本 seed0=100+step 致各 ckpt 初始不同（reach 200k=1.0/500k=0.0
+        # 非单调暴露污染），已修正为固定 seed。
+        succ, rew = eval_ckpt(sd, task_names, tasks, args.eps, device, seed0=42)
         results[str(step)] = {"succ": succ.tolist(), "rew": rew.tolist(),
                               "task_names": task_names}
         # 增量落盘，崩溃可续
