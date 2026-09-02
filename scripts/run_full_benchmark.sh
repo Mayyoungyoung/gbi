@@ -216,8 +216,8 @@ run_stage_entry() {
     esac
 }
 
-if [ "$1" = "--one" ]; then
-    run_stage_entry "$2"
+if [ "${1:-}" = "--one" ]; then
+    run_stage_entry "${2:-}"
     exit $?
 fi
 
