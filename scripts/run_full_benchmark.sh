@@ -200,9 +200,11 @@ stage_guide() {
 log "pipeline 启动；阶段列表: $STAGES"
 log "候选快照池: $CAND_DIR"
 
-for entry in $STAGES; do
-    alg="${entry%%:*}"
-    seed="${entry##*:}"
+# 单 stage 入口（并行调度用）：bash run_full_benchmark.sh --one gbi:0
+run_stage_entry() {
+    local entry="$1"
+    local alg="${entry%%:*}"
+    local seed="${entry##*:}"
     case "$alg" in
         gbi)         stage_gbi "$seed" ;;
         qmp)         stage_qmp "$seed" ;;
@@ -210,8 +212,34 @@ for entry in $STAGES; do
         qmp_online)  stage_qmp_online "$seed" ;;
         indep)       stage_indep "$seed" ;;
         guide)       stage_guide "$seed" ;;
-        *) log "未知阶段 $entry，中止"; exit 2 ;;
+        *) log "未知阶段 $entry，中止"; return 2 ;;
     esac
+}
+
+if [ "$1" = "--one" ]; then
+    run_stage_entry "$2"
+    exit $?
+fi
+
+if [ "${PARALLEL:-0}" = "1" ]; then
+    # 并行模式（2026-09-02）：10 个 stage 无相互依赖（候选池固定为 seed0 快照），
+    # 实测单进程显存 <1GB（qmp）、GPU 利用率 ~40%（瓶颈在 CPU 环境交互），
+    # 单卡 T4 15GB + 96 核 CPU 可安全并行；MAX_PARALLEL 控制并发（建议 4-6）
+    MAX_PARALLEL="${MAX_PARALLEL:-4}"
+    log "并行模式启动（并发=$MAX_PARALLEL）: $STAGES"
+    echo "$STAGES" | tr ' ' '\n' | grep -v '^$' | \
+        xargs -P "$MAX_PARALLEL" -I{} bash "$0" --one {}
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        log "并行流水线存在失败 stage（rc=$rc），检查各 run 目录的 *_FAILED 标记"
+    fi
+    refresh_report
+    log "=== 全部阶段完成。最终报告: $REPORT_DIR/benchmark_report.md ==="
+    exit $rc
+fi
+
+for entry in $STAGES; do
+    run_stage_entry "$entry"
     if [ $? -ne 0 ]; then
         log "流水线在阶段 $entry 中止。修复后重新执行本脚本可断点续跑。"
         exit 1
