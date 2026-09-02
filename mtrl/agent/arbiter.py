@@ -51,14 +51,21 @@ def spearman_rank(x: np.ndarray, y: np.ndarray) -> float:
 
 
 class Candidate:
-    """候选策略：名称 + 冻结 actor + 均值动作接口。"""
+    """候选策略：名称 + actor + 均值/采样动作接口。
+
+    freeze=True 用于磁盘加载的独立快照（冻结防漂移）；
+    own 候选传入现役 actor 本体引用，必须 freeze=False ——
+    否则 requires_grad_(False) 会关闭现役 actor 的梯度，
+    导致训练静默失效（高危 #7，2026-09-02 实锤）。
+    """
 
     def __init__(self, name: str, actor: torch.nn.Module, action_range: Tuple[float, float],
-                 device: torch.device):
+                 device: torch.device, freeze: bool = True):
         self.name = name
         self.actor = actor.to(device).eval()
-        for p in self.actor.parameters():
-            p.requires_grad_(False)
+        if freeze:
+            for p in self.actor.parameters():
+                p.requires_grad_(False)
         self.action_range = action_range
         self.device = device
 
@@ -203,7 +210,9 @@ class Arbiter:
                 task_info=TaskInfo(encoding=None, compute_grad=False, env_index=task_t),
             )
             q1, q2 = self.critic(mtobs=mtobs, action=a, detach_encoder=False)
-            cols.append(((q1 + q2) / 2.0).squeeze(-1))
+            # min 口径（2026-09-02）：与 SAC 值学习（target 用 min）一致，
+            # 防止打分高估；此前 (q1+q2)/2 会系统性偏高且偏向过乐观的候选
+            cols.append(torch.min(q1, q2).squeeze(-1))
         return torch.stack(cols, dim=1)  # (B, N)
 
     @torch.no_grad()
@@ -245,7 +254,14 @@ class Arbiter:
         """
         B = obs.shape[0]
         Q = self.q_anchor(obs, task_ids)          # (B, N)
-        I, U = self.imagine(obs, task_ids)        # (B, N), (B, N)
+        if self.mode == "qmp":
+            # QMP 基线：S=Q 每步 argmax，想象通道（gain/U）不参与裁决。
+            # 跳过 close-loop rollout 省约 4× 算力（u_trigger 仅归档用途，填 0；
+            # qmp 的 τ 统计无语义，2026-09-02 性能修复）
+            I = torch.zeros_like(Q)
+            U = torch.zeros_like(Q)
+        else:
+            I, U = self.imagine(obs, task_ids)    # (B, N), (B, N)
         # 自身基线 = 候选集第一项（index 0 = 现役自身策略）
         I_own = I[:, 0:1]                          # (B, 1)
         Q_own = Q[:, 0:1]

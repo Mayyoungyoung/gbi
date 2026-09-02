@@ -35,6 +35,15 @@ gbi:
   # 候选快照池（Phase 0/M3：state_sac 训练快照的 model_dir 与 step 列表）
   candidates_dir: null
   candidate_steps: []
+  # 在线自举候选（免预训练直接开训，2026-09-02）：enabled 时每 interval 步
+  # 将现役 actor 快照（deepcopy+冻结）入池，FIFO 保留最近 max_count 个；
+  # 与 candidates_dir 可叠加（先淘汰更老的磁盘快照）。像 CTPG 一样开箱即训时：
+  #   candidates_dir 留 null + online_candidates.enabled=true
+  online_candidates:
+    enabled: False
+    interval: 25000
+    warmup: 20000
+    max_count: 4
   source_log_dump_every: 10000
 
 builder:

@@ -29,6 +29,7 @@
 #   trigger_mode: adaptive | fixed_K | always
 
 from collections import deque
+import copy
 import os
 import time
 from typing import Any, Deque, Dict, List, Optional
@@ -113,9 +114,11 @@ class Agent(SACAgent):
         self._components["world_model"] = self.world_model
 
         # ---- 候选集：index 0 = 现役自身策略（同一 actor 引用，天然同步）；
-        #      其余为 state_sac 训练快照（early/mid/late） ----
+        #      其余为 state_sac 训练快照（early/mid/late）
+        # freeze=False：own 传入 self.actor 本体引用，若被 Candidate 冻结
+        # 则现役 actor 梯度永久关闭（高危 #7，2026-09-02 修复）
         self.candidates: List[Candidate] = [
-            Candidate("own", self.actor, self.action_range, device)
+            Candidate("own", self.actor, self.action_range, device, freeze=False)
         ]
         self._load_snapshot_candidates(
             actor_cfg=actor_cfg,
@@ -123,6 +126,17 @@ class Agent(SACAgent):
             action_shape=action_shape,
             device=device,
         )
+
+        # ---- 在线自举候选（免预训练直接开训，2026-09-02 新增）：
+        #      每 interval 步将现役 actor 快照（deepcopy+冻结）入池，
+        #      FIFO 保留最近 max_count 个；与磁盘快照池可叠加（先淘汰更老的磁盘快照）
+        oc = (self.gbi_cfg.get("online_candidates", None) or {})
+        self._oc_enabled = bool(oc.get("enabled", False))
+        self._oc_interval = max(1, int(oc.get("interval", 25000)))
+        self._oc_warmup = int(oc.get("warmup", 20000))
+        self._oc_max_count = max(0, int(oc.get("max_count", 4)))
+        self._oc_last_snap = -1
+        self._oc_pending_evict = False
 
         # ---- 裁决器 ----
         self.arbiter = Arbiter(
@@ -331,12 +345,14 @@ class Agent(SACAgent):
                 u_trigger_np.mean()
             )
             for i in range(B):
+                j_i = int(sources[i]) if sources[i] < len(self.candidates) else 0
                 self._source_records.append(
                     {
                         "step": int(self.train_step),
                         "env": int(i),
                         "task": int(self._env_tasks[i]),
                         "source": int(sources[i]),
+                        "source_name": self.candidates[j_i].name,
                         "triggered": bool(triggered[i]),
                         "u": float(u_trigger_np[i]),
                         "s_chosen": float(S_np[i, chosen_np[i]]),
@@ -405,6 +421,15 @@ class Agent(SACAgent):
             logger.log("train/gbi_seg_count", float(self._seg_count_total), step)
         for key, value in self._last_adapt_metrics.items():
             logger.log(f"train/gbi_{key}", value, step)
+
+        # ---- 在线自举候选：到点注册新快照；段活跃期间延迟淘汰（避免段引用的
+        #      候选 index 因 FIFO 平移而错位，段最长 K_max+1 步，延迟无碍） ----
+        if self._oc_enabled and step >= self._oc_warmup and (
+            self._oc_last_snap < 0 or step - self._oc_last_snap >= self._oc_interval
+        ):
+            self._register_online_candidate(step)
+        elif self._oc_pending_evict and not self._seg:
+            self._evict_old_candidates()
 
         # ---- 来源归档落盘 ----
         dump_every = int(self.gbi_cfg.get("source_log_dump_every", 10000))
@@ -531,6 +556,34 @@ class Agent(SACAgent):
             self.arbiter.cancel_segment(index)
             self._closing.append(index)
 
+    def _register_online_candidate(self, step: int) -> None:
+        """deepcopy 现役 actor 入池（冻结）；超出 max_count 时 FIFO 淘汰
+        index 1 起的最老快照（candidates[0] 恒为 own 现役引用）。"""
+        snap = copy.deepcopy(self.actor)
+        cand = Candidate(
+            f"online_{step}", snap, self.action_range, self.device, freeze=True
+        )
+        self.candidates.append(cand)
+        self._oc_last_snap = step
+        if len(self.candidates) > 1 + self._oc_max_count:
+            if self._seg:
+                self._oc_pending_evict = True  # 段活跃，延迟到段清空后再淘汰
+            else:
+                self._evict_old_candidates()
+        print(
+            f"[gbi] online candidate registered: {cand.name} "
+            f"(pool={[c.name for c in self.candidates]})"
+        )
+
+    def _evict_old_candidates(self) -> None:
+        """FIFO 淘汰最老快照，直到回到 1(own) + max_count 个候选。"""
+        self._oc_pending_evict = False
+        evicted = []
+        while len(self.candidates) > 1 + self._oc_max_count:
+            evicted.append(self.candidates.pop(1).name)
+        if evicted:
+            print(f"[gbi] online candidates evicted (FIFO): {evicted}")
+
     def _dump_source_log(self, final: bool = False) -> None:
         if not self._source_records:
             return
@@ -540,14 +593,15 @@ class Agent(SACAgent):
         )
         records = self._source_records
         self._source_records = []
-        keys = [
-            "step", "env", "task", "source", "triggered", "u", "s_chosen",
-        ]
         arrays = {
             "step": np.asarray([r["step"] for r in records], dtype=np.int64),
             "env": np.asarray([r["env"] for r in records], dtype=np.int64),
             "task": np.asarray([r["task"] for r in records], dtype=np.int64),
             "source": np.asarray([r["source"] for r in records], dtype=np.int64),
+            # FIFO 淘汰会使 source index 跨时间漂移，分析时按 source_name 聚合
+            "source_name": np.asarray(
+                [r.get("source_name", "") for r in records], dtype="U32"
+            ),
             "triggered": np.asarray([r["triggered"] for r in records], dtype=bool),
             "u": np.asarray([r["u"] for r in records], dtype=np.float32),
             "s_chosen": np.asarray([r["s_chosen"] for r in records], dtype=np.float32),

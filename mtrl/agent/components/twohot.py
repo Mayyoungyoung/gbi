@@ -97,14 +97,18 @@ def twohot_label(
 
 
 def bins_to_reward(logits: TensorType, twohot: TwoHotSymlog) -> TensorType:
-    """two-hot logits → 期望奖励（原始空间）。两种口径：
+    """two-hot logits → 期望奖励（原始空间）。
 
-    - 期望用 symlog 空间分箱中心按 softmax 加权：mode='symlog_expect'
-    - 原始空间中心加权：mode='raw_expect'（默认，与评估偏置表口径一致）
+    期望在 symlog 分箱空间计算后整体 symexp 反解（DreamerV3 口径）：
+    E[r] = symexp(Σ probs·center_symlog)。
+    早期版本直接在 raw 空间加权（Σ probs·symexp(center)）：bin 中心被
+    symexp 拉到 ±400，softmax 尾部微小概率泄漏到极端 bin 即绑架期望
+    （±2 级偏差，远大于真实 scaled reward ±1），想象打分噪声过大
+    （中危 #8，2026-09-02 修复）。
     """
     probs = torch.softmax(logits, dim=-1)  # (..., bins)
-    raw = (probs * twohot.bin_centers_raw.to(logits.device)).sum(dim=-1)
-    return raw
+    y = (probs * twohot.bin_centers.to(logits.device)).sum(dim=-1)
+    return symexp(y)
 
 
 def twohot_loss(

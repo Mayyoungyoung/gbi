@@ -544,7 +544,7 @@ class WorldModel(base_component.Component):
                 onehot = self._task_onehot(task)
                 logits0 = self.predict_reward(h, onehot)
                 losses_before.append(
-                    float(twohot_loss(logits0[0], r, self.twohot, reduction="mean").cpu())
+                    float(twohot_loss(logits0.mean(dim=0), r, self.twohot, reduction="mean").cpu())
                 )
             for _ in range(num_steps):
                 z = self.encode(s).detach()  # 冻结编码器输出
@@ -563,7 +563,7 @@ class WorldModel(base_component.Component):
             with torch.no_grad():
                 logits1 = self.predict_reward(h_det, onehot)
                 losses_after.append(
-                    float(twohot_loss(logits1[0], r, self.twohot, reduction="mean").cpu())
+                    float(twohot_loss(logits1.mean(dim=0), r, self.twohot, reduction="mean").cpu())
                 )
 
         for pg in self.adapt_optimizer.param_groups:

@@ -33,7 +33,7 @@ mkdir -p "$REPORT_DIR"
 CAND_DIR="$RUNS_ROOT/state_sac_indep/mt10/seed0/logs/metaworld-mt10/state_sac/2026-08-31-09-54-56_issue_57d4f43a4bf96214e8f7be83a0564528bff75e77_seed_0/model"
 CAND_STEPS="[50000,100000,150000,200000,250000,300000,350000,400000,450000,500000]"
 
-DEFAULT_STAGES="gbi:0 qmp:0 indep:1 gbi:1 qmp:1 indep:2 guide:0 guide:1"
+DEFAULT_STAGES="gbi:0 qmp:0 gbi_online:0 qmp_online:0 indep:1 gbi:1 qmp:1 indep:2 guide:0 guide:1"
 STAGES="${RUN_STAGES:-$DEFAULT_STAGES}"
 
 # gbi/qmp 共用的多任务配置（与 2026-08-31-14-02-10 GbI 主实验完全一致）
@@ -129,6 +129,43 @@ stage_qmp() {
     run_stage "qmp:$seed" "$run_dir" "metaworld-mt10/qmp" "${cmd[@]}"
 }
 
+# 在线自举变体（2026-09-02）：像 CTPG 一样免预训练直接开训——
+# 候选池不再用磁盘快照，而是每 25k 步在线 snapshot 现役 actor（FIFO 保留 4 个）。
+# gbi_online = 完整裁决；qmp_online = 其 λ≡0 消融（隔离"在线候选池"与"想象增益"两个变量）
+stage_gbi_online() {
+    local seed="$1"
+    local run_dir="$RUNS_ROOT/gbi_online/metaworld/mt10/seed$seed"
+    local cmd=(python3 -u main.py
+      setup.alg=gbi_sac "setup.id=seed$seed" "setup.seed=$seed" "setup.base_path=$run_dir"
+      env=metaworld-mt10 agent=gbi_sac metrics=mtrl_gbi experiment.name=metaworld
+      experiment.num_train_steps=300000 experiment.eval_freq=20000 experiment.num_eval_episodes=10
+      replay_buffer.capacity=1000000 replay_buffer.batch_size=1024
+      "${COMMON[@]}"
+      agent.gbi.candidates_dir=null
+      agent.gbi.online_candidates.enabled=True
+      agent.gbi.arbiter_mode=gbi agent.gbi.trigger_mode=adaptive
+      experiment.save.model.should_save=True experiment.save_freq=20000
+      experiment.save.model.retain_last_n=5)
+    run_stage "gbi_online:$seed" "$run_dir" "metaworld-mt10/gbi_sac" "${cmd[@]}"
+}
+
+stage_qmp_online() {
+    local seed="$1"
+    local run_dir="$RUNS_ROOT/qmp_online/metaworld/mt10/seed$seed"
+    local cmd=(python3 -u main.py
+      setup.alg=qmp_online "setup.id=seed$seed" "setup.seed=$seed" "setup.base_path=$run_dir"
+      env=metaworld-mt10 agent=gbi_sac metrics=mtrl_gbi experiment.name=metaworld
+      experiment.num_train_steps=300000 experiment.eval_freq=20000 experiment.num_eval_episodes=10
+      replay_buffer.capacity=1000000 replay_buffer.batch_size=1024
+      "${COMMON[@]}"
+      agent.gbi.candidates_dir=null
+      agent.gbi.online_candidates.enabled=True
+      agent.gbi.arbiter_mode=qmp agent.gbi.trigger_mode=always
+      experiment.save.model.should_save=True experiment.save_freq=20000
+      experiment.save.model.retain_last_n=5)
+    run_stage "qmp_online:$seed" "$run_dir" "metaworld-mt10/qmp_online" "${cmd[@]}"
+}
+
 stage_indep() {
     local seed="$1"
     local run_dir="$RUNS_ROOT/state_sac_indep/mt10/seed$seed"
@@ -167,10 +204,12 @@ for entry in $STAGES; do
     alg="${entry%%:*}"
     seed="${entry##*:}"
     case "$alg" in
-        gbi)   stage_gbi "$seed" ;;
-        qmp)   stage_qmp "$seed" ;;
-        indep) stage_indep "$seed" ;;
-        guide) stage_guide "$seed" ;;
+        gbi)         stage_gbi "$seed" ;;
+        qmp)         stage_qmp "$seed" ;;
+        gbi_online)  stage_gbi_online "$seed" ;;
+        qmp_online)  stage_qmp_online "$seed" ;;
+        indep)       stage_indep "$seed" ;;
+        guide)       stage_guide "$seed" ;;
         *) log "未知阶段 $entry，中止"; exit 2 ;;
     esac
     if [ $? -ne 0 ]; then

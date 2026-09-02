@@ -85,11 +85,30 @@ def _seed_async_env(vec_env, seed):
 
 def _repack_gymnasium_step(vec_env, multitask_obs, reward, terminated, truncated, infos):
     """Convert gymnasium 5-tuple step into the old gym 4-tuple step:
-    (obs, reward, done, info_list)."""
+    (obs, reward, done, info_list).
+
+    gymnasium 1.x returns `infos` organized per-key as batched arrays
+    (e.g. {'success': array([...]), '_success': mask}), NOT per-env dicts
+    as in gym 0.21 — parse accordingly（高危 #6，2026-09-02 修复）.
+    """
     done = np.logical_or(terminated, truncated)
+    num_envs = vec_env.num_envs
     info_list = []
-    for i in range(vec_env.num_envs):
-        info = infos[i] if i in infos else {}
+    for i in range(num_envs):
+        info = {}
+        for key, value in infos.items():
+            if key.startswith("_"):
+                continue  # boolean availability masks
+            if isinstance(value, np.ndarray) and value.ndim > 0 and i < len(value):
+                mask = infos.get("_" + key)
+                if (
+                    isinstance(mask, np.ndarray)
+                    and mask.ndim > 0
+                    and i < len(mask)
+                    and not bool(mask[i])
+                ):
+                    continue  # this env did not provide this key on this step
+                info[key] = value[i]
         # gymnasium autoreset steps carry a bare reset info dict; fill the keys
         # that the CTPG training/eval loops read unconditionally.
         info.setdefault("success", 0.0)
