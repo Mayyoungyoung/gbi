@@ -1,6 +1,6 @@
 # GbI 实验当前情况总结
 
-> 更新时间：2026-09-02 08:00 UTC（四轮审查通过 + git 同步完成 + 并行模式就绪）
+> 更新时间：2026-09-02 09:00 UTC（四轮审查 + 并行实测校准 + git 同步 + **Phase 0 决策场复测通过**）
 > 关联文档：[GbI.md](GbI.md)（设计）、[GbI_Experiment_Guide.md](GbI_Experiment_Guide.md)（复现指南）
 
 ## 摘要
@@ -16,6 +16,7 @@
 | 冒烟验证 | ✅ **通过（09-02 06:00）** | 3000 步端到端：entropy 5.68→5.33→5.13 持续下降（冻结时恒 5.68；state_sac 同期 5.32 几乎一致）；α 0.995→0.887 正常收缩；`ES_i=200` 实测生效；冒烟数据已清理 |
 | 三轮审查 + 优化 | ✅ 完成 | qmp 跳过想象（~4× 提速）；q_anchor 改 min 口径；详见 §四三轮审查节 |
 | 在线自举候选池 | ✅ **已实现 + 冒烟通过** | GbI 免预训练直接开训（像 CTPG）；注册/FIFO 淘汰/段活跃延迟淘汰链路实测正常；gbi_online/qmp_online 两个 stage 已入流水线 |
+| Phase 0 决策场 | ✅ **复测通过（09-02）** | 10 ckpt 真实 rollout 重测（state_sac 原 success 记录全废 #6）；200k-500k own 最优率 0.8-0.9 ≥0.5、gap 1.0>0.1（详见 §四决策场节） |
 | CTPG 基线（guide_sac） | ✅ **路径验证通过** | guide 冒烟 COMPLETED：ES_i=200（#6 对 guide 生效）、no_guide 门控在动、训练交互出现成功（Su_5=0.4）；对比矩阵见 §四 CTPG 节 |
 | 脚本 | ✅ 可用 | run_gbi_nohup.sh / run_gbi_then_qmp.sh 正常；run_full_benchmark.sh 已升级（新增 gbi_online/qmp_online stage + 并行调度 PARALLEL=1）；**代码已同步至 github.com:Mayyoungyoung/gbi.git（f8cb190 修复 + f4cbdd3 并行）** |
 
@@ -191,8 +192,28 @@ self.candidates: List[Candidate] = [
 - **候选执行用任务 i 自己的 head**：multi-head 由 task_obs 经 moe_masks 选择（actor.model_forward），候选池=“不同训练阶段快照”**符合 GbI.md L208 的 v5 设计**（决策场改造方案）；但与 §1“其他任务策略临时接管”（对标 CTPG）的叙事存在张力——实际是“自己早期版本接管”（时间维指导），论文写作时需注意表述；
 - GbI.md 自带警示（L199）依然有效：Phase 0 决策场验收（own-policy 最优率 ≥0.5、gap 中位数 >0.1）在重跑前建议补测，避免再次空转。
 
-### 四轮审查（2026-09-02 下午：stage 参数一致性 + 模块盘点 + 并行能力）
+### Phase 0 决策场复测（2026-09-02 通过，GbI.md L208 验收线）
 
+**背景**：state_sac seed0 run 的 success 信号全程恒 0（#6 gymnasium infos bug 受害者——含 eval 记录；先前文档「eval 8.5→85」实为 episode_reward 均值，**成功率从未被正确记录**）；验收线（own 最优率 ≥0.5 + gap 中位数 >0.1）需要 success → 用修复后代码重测。
+
+**方法**：`scripts/alg/eval_decision_field.py`（手工复现 multi-head actor 前向，10 ckpt × 10 任务 × 20 eps，3 分片并行 ~25 分钟）+ `analyze_decision_field.py` 报告。关键修正：跨模型必须同初始 seed（早期 seed0=100+step 致 reach 200k=1.0/500k=0.0 非单调污染，已修正为固定 42）。结果在 `gbi/experiments/results/phase0/`。
+
+**结果（同 seed=42，20 eps/任务）**：
+
+| own | 最优率 | 有效最优率* | 被超越 | 正向 gap |
+|-----|--------|------------|--------|----------|
+| 50k-150k | 0.50 | 0.17 | 5/10 | 1.00 |
+| 200k-300k | 0.80 | 0.67 | 2/10 | 1.00 |
+| 350k-450k | 0.90 | 0.83 | 1/10 | 1.00 |
+| 500k | 0.80 | 0.67 | 2/10 | 1.00 |
+
+*有效最优率：剔除 3 个全池 0 任务（pick-place/drawer-open/peg-insert，300k 内未学会，与训练 reward 低一致）后的重算。
+
+**判定：✅ 决策场非空，验收线通过**（own 最优率 0.8-0.9 ≥0.5；被超越任务 gap 1.0 >0.1）。训练中段（200k-450k）own 最优率持续达标；早期（50k-150k）own 有效最优率仅 0.17（被全面超越——Gbi 场景下 own 早期弱是正常态，正是裁决/护栏用武之地）。
+
+**额外发现（重要）**：① reach-v3 出现非单调：200k=1.0 后 250k 起恒 0（共享 trunk 被多数任务梯度扰动后丢失）——快照池「时间维指导」的真实机会；② 成功率绝对值低（mean 0.4-0.5@500k）是随机变体 + 200 步截断所致，训练 eval 同协议 → 跨算法相对可比；③ 注意 pick-place/drawer-open/peg-insert 三难任务 300k 预算内所有算法都难学会，对比表需标注。
+
+### 四轮审查（2026-09-02 下午：stage 参数一致性 + 模块盘点 + 并行能力）
 **核查项（均通过）**：
 
 - stage 参数与冒烟/历史 run 逐一对比：COMMON 数组含全部 8 个 multitask 参数且 gbi/qmp/gbi_online/qmp_online/guide 五个 stage 均引用；guide 的 task_onehot 由 COMMON 覆盖为 False（yaml 默认 True）；encoder 默认即 identity；**无参数漂移**（历史上 03-54-24 run 与 state_sac 快照池实际生效配置 multi_head=True/identity 与 COMMON 一致，候选加载兼容）；
