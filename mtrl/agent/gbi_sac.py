@@ -113,25 +113,57 @@ class Agent(SACAgent):
         )
         self._components["world_model"] = self.world_model
 
-        # ---- 候选集：index 0 = 现役自身策略（同一 actor 引用，天然同步）；
-        #      其余为 state_sac 训练快照（early/mid/late）
-        # freeze=False：own 传入 self.actor 本体引用，若被 Candidate 冻结
+        # ---- 候选集（P0.1，2026-09-03 起两种模式）：
+        #      A. cross_task_candidates.enabled=True（跨任务池，与 CTPG 同池语义）：
+        #         候选 = 现役 actor 的 N 个任务 head（task_id=j，裁决/执行均用
+        #         head j 出动作）；own = 任务 i 自己的 head（arbiter.own_index
+        #         逐 env 对角定位）。忽略快照池与在线池。
+        #      B. legacy（快照池 / 在线池 / 两者叠加）：index 0 = 现役自身策略
+        #         （同一 actor 引用，天然同步），其余为 state_sac 训练快照。
+        # freeze=False：own/cross 传入现役 actor 本体引用，若被 Candidate 冻结
         # 则现役 actor 梯度永久关闭（高危 #7，2026-09-02 修复）
-        self.candidates: List[Candidate] = [
-            Candidate("own", self.actor, self.action_range, device, freeze=False)
-        ]
-        self._load_snapshot_candidates(
-            actor_cfg=actor_cfg,
-            env_obs_shape=env_obs_shape,
-            action_shape=action_shape,
-            device=device,
-        )
+        ctc = (self.gbi_cfg.get("cross_task_candidates", None) or {})
+        self._ctc_enabled = bool(ctc.get("enabled", False))
+        if self._ctc_enabled:
+            if self.gbi_cfg.get("candidates_dir", None) or (
+                self.gbi_cfg.get("online_candidates", None) or {}
+            ).get("enabled", False):
+                print(
+                    "[gbi] cross_task_candidates enabled: "
+                    "snapshot/online candidate pools are ignored"
+                )
+            self.candidates: List[Candidate] = [
+                Candidate(
+                    f"task{j}",
+                    self.actor,
+                    self.action_range,
+                    device,
+                    freeze=False,
+                    task_id=j,
+                )
+                for j in range(self.num_envs)
+            ]
+            print(
+                f"[gbi] cross-task candidate pool: {self.num_envs} live task heads "
+                f"{[c.name for c in self.candidates]}"
+            )
+        else:
+            self.candidates: List[Candidate] = [
+                Candidate("own", self.actor, self.action_range, device, freeze=False)
+            ]
+            self._load_snapshot_candidates(
+                actor_cfg=actor_cfg,
+                env_obs_shape=env_obs_shape,
+                action_shape=action_shape,
+                device=device,
+            )
 
         # ---- 在线自举候选（免预训练直接开训，2026-09-02 新增）：
         #      每 interval 步将现役 actor 快照（deepcopy+冻结）入池，
         #      FIFO 保留最近 max_count 个；与磁盘快照池可叠加（先淘汰更老的磁盘快照）
+        #      cross 模式下禁用（候选池语义冲突且 FIFO 淘汰假设 index 0 = own）
         oc = (self.gbi_cfg.get("online_candidates", None) or {})
-        self._oc_enabled = bool(oc.get("enabled", False))
+        self._oc_enabled = bool(oc.get("enabled", False)) and not self._ctc_enabled
         self._oc_interval = max(1, int(oc.get("interval", 25000)))
         self._oc_warmup = int(oc.get("warmup", 20000))
         self._oc_max_count = max(0, int(oc.get("max_count", 4)))
@@ -259,6 +291,7 @@ class Agent(SACAgent):
             res = self.arbiter.score(obs, task_t)
             u_trigger_np = res["u_trigger"].detach().cpu().numpy()  # (B,)
             chosen_np = res["chosen"].detach().cpu().numpy()        # (B,)
+            own_idx_np = res["own_idx"].detach().cpu().numpy()      # (B,) 自身候选下标
             gain_np = res["gain"].detach().cpu().numpy()            # (B, N)
             S_np = res["S"].detach().cpu().numpy()
 
@@ -280,7 +313,8 @@ class Agent(SACAgent):
 
             # 4) 逐 env 决策与动作装配
             actions = np.zeros((B, self.action_shape[0]), dtype=np.float32)
-            sources = np.zeros(B, dtype=np.int64)
+            # 自身执行步的 source 记自身候选下标（legacy 池 = 0，cross 池 = 对角）
+            sources = own_idx_np.astype(np.int64).copy()
             triggered = np.zeros(B, dtype=bool)
 
             for i in range(B):
@@ -314,7 +348,8 @@ class Agent(SACAgent):
                     self._trigger_count_total += 1
                     triggered[i] = True
                     j = int(chosen_np[i])
-                    if j > 0:
+                    # 换手 = 选中非自身候选（legacy 池 own=0，即 j != 0）
+                    if j != int(own_idx_np[i]):
                         c = self.candidates[j]
                         actions[i] = (
                             c.sample_action(obs[i : i + 1], task_t[i : i + 1])

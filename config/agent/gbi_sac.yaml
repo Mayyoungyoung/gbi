@@ -35,6 +35,11 @@ gbi:
   # 候选快照池（Phase 0/M3：state_sac 训练快照的 model_dir 与 step 列表）
   candidates_dir: null
   candidate_steps: []
+  # 跨任务候选池（P0.1，2026-09-03）：候选 = 现役 actor 的 N 个任务 head
+  # （CTPG 同池语义：任务 j 的策略可在任务 i 上被裁决接管；own = 任务 i head）。
+  # enabled 时忽略 candidates_dir 与 online_candidates（互斥，避免池语义混杂）
+  cross_task_candidates:
+    enabled: False
   # 在线自举候选（免预训练直接开训，2026-09-02）：enabled 时每 interval 步
   # 将现役 actor 快照（deepcopy+冻结）入池，FIFO 保留最近 max_count 个；
   # 与 candidates_dir 可叠加（先淘汰更老的磁盘快照）。像 CTPG 一样开箱即训时：

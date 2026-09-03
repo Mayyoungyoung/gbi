@@ -57,10 +57,15 @@ class Candidate:
     own 候选传入现役 actor 本体引用，必须 freeze=False ——
     否则 requires_grad_(False) 会关闭现役 actor 的梯度，
     导致训练静默失效（高危 #7，2026-09-02 实锤）。
+
+    task_id（P0.1，2026-09-03）：跨任务候选固定用「候选自己的任务 head」
+    出动作（CTPG 同池语义：任务 j 的策略可在任务 i 上被裁决接管）；
+    None = legacy 行为，沿用调用方传入的 env 任务 id（快照/own/online 候选）。
     """
 
     def __init__(self, name: str, actor: torch.nn.Module, action_range: Tuple[float, float],
-                 device: torch.device, freeze: bool = True):
+                 device: torch.device, freeze: bool = True,
+                 task_id: Optional[int] = None):
         self.name = name
         self.actor = actor.to(device).eval()
         if freeze:
@@ -68,6 +73,15 @@ class Candidate:
                 p.requires_grad_(False)
         self.action_range = action_range
         self.device = device
+        self.task_id = task_id
+
+    def _resolve_task_ids(self, task_ids: TensorType, B: int) -> TensorType:
+        """task_ids: (B, 1) env 任务 id → (B, 1) 实际用于选 head 的 id。
+        跨任务候选覆盖为自身 task_id（多头 mask 按 env_index 选 head）。"""
+        task_t = task_ids.long().to(self.device).reshape(B, 1)
+        if self.task_id is not None:
+            task_t = torch.full_like(task_t, int(self.task_id))
+        return task_t
 
     @torch.no_grad()
     def mean_action(self, obs: TensorType, task_ids: TensorType) -> TensorType:
@@ -78,7 +92,7 @@ class Candidate:
         """
         B = obs.shape[0]
         obs_t = obs.float().to(self.device)
-        task_t = task_ids.long().to(self.device).reshape(B, 1)
+        task_t = self._resolve_task_ids(task_ids, B)
         mtobs = MTObs(
             env_obs=obs_t,
             task_obs=task_t,
@@ -97,7 +111,7 @@ class Candidate:
         """
         B = obs.shape[0]
         obs_t = obs.float().to(self.device)
-        task_t = task_ids.long().to(self.device).reshape(B, 1)
+        task_t = self._resolve_task_ids(task_ids, B)
         mtobs = MTObs(
             env_obs=obs_t,
             task_obs=task_t,
@@ -191,6 +205,23 @@ class Arbiter:
     def register_discount(self, disc: TensorType) -> None:
         self.discount = disc  # (H-1,)
 
+    def own_index(self, task_ids: TensorType) -> TensorType:
+        """每行的「自身候选」下标 (B,)。
+
+        跨任务候选（task_id != None）：行任务 id == i → 自身候选 =
+        task_id == i 的第一个候选（cross 池下 own = 现役 actor 的任务 i head）。
+        legacy 候选（own/快照/online，task_id=None）：自身候选恒为 index 0，
+        与 v5 行为完全一致（全 0 向量）。
+        """
+        B = task_ids.reshape(-1).shape[0]
+        ids = task_ids.long().to(self.device).reshape(-1)  # (B,)
+        own = torch.zeros(B, dtype=torch.long, device=self.device)
+        for idx, c in enumerate(self.candidates):
+            if c.task_id is None:
+                continue
+            own = torch.where(ids == c.task_id, torch.full_like(own, idx), own)
+        return own
+
     # ------------------------------------------------------------------ #
     # 打分核心
     # ------------------------------------------------------------------ #
@@ -248,11 +279,13 @@ class Arbiter:
         task_ids: TensorType,
     ) -> Dict[str, TensorType]:
         """完整裁决打分：
-        返回 {S(B,N), Q(B,N), I(B,N), U(B,N), chosen(B,), chosen_idx(B,), u_trigger(B,)}。
-        task_ids 每 env 是自己的任务 i；batch 内必须同任务（rollout 的 task 条件按
-        首个元素设定，Phase 0 评估按任务分批调用）。
+        返回 {S(B,N), Q(B,N), I(B,N), U(B,N), chosen(B,), chosen_idx(B,),
+        u_trigger(B,), own_idx(B,), gain(B,N)}。
+        task_ids 每 env 是自己的任务 i；own_idx 为每行的自身候选下标
+        （cross 池 = 对角；legacy 池 = 全 0，v5 行为不变）。
         """
         B = obs.shape[0]
+        own_idx = self.own_index(task_ids)        # (B,)
         Q = self.q_anchor(obs, task_ids)          # (B, N)
         if self.mode == "qmp":
             # QMP 基线：S=Q 每步 argmax，想象通道（gain/U）不参与裁决。
@@ -262,9 +295,8 @@ class Arbiter:
             U = torch.zeros_like(Q)
         else:
             I, U = self.imagine(obs, task_ids)    # (B, N), (B, N)
-        # 自身基线 = 候选集第一项（index 0 = 现役自身策略）
-        I_own = I[:, 0:1]                          # (B, 1)
-        Q_own = Q[:, 0:1]
+        # 自身基线：每行取 own_idx 指向的候选（legacy 池 = index 0）
+        I_own = I.gather(1, own_idx.view(-1, 1))  # (B, 1)
         gain = I - I_own                           # (B, N) 相对想象增益
         if self.mode == "qmp":
             S = Q
@@ -272,21 +304,22 @@ class Arbiter:
             S = gain
         else:  # gbi
             S = Q + self.lambda_t * gain
-        # 护栏：U > τ_reject → 保持自身（S 第 0 列拉满）。
+        # 护栏：U > τ_reject → 保持自身（S 的 own 列拉满）。
         # 仅 gbi/imag 生效：τ_reject 拒绝属于 GbI 触发机制，QMP 基线（每步
         # argmax Q）不得引入该行为，否则破坏与主实验的“唯一变量”对照。
         u_trigger = U.max(dim=1).values          # (B,)
         chosen = S.argmax(dim=1)                  # (B,)
         if self.guardrail_reject and self.mode != "qmp":
             reject_mask = u_trigger > self.tau_reject
-            chosen = torch.where(reject_mask, torch.zeros_like(chosen), chosen)
+            chosen = torch.where(reject_mask, own_idx, chosen)
         # 换手要求相对增益 > 0
         if self.switch_requires_positive_gain and self.mode == "gbi":
             gain_of_chosen = gain.gather(1, chosen.unsqueeze(1)).squeeze(-1)
-            chosen = torch.where(gain_of_chosen > 0, chosen, torch.zeros_like(chosen))
+            chosen = torch.where(gain_of_chosen > 0, chosen, own_idx)
         return {
             "S": S, "Q": Q, "I": I, "U": U,
             "chosen": chosen, "u_trigger": u_trigger, "gain": gain,
+            "own_idx": own_idx,
         }
 
     # ------------------------------------------------------------------ #
