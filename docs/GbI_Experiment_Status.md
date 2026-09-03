@@ -1,6 +1,6 @@
 # GbI 实验当前情况总结
 
-> 更新时间：2026-09-03 07:00 UTC（benchmark 批次进行中 + **R1 根因确诊：候选池实现偏离设计** + P0.1 跨任务候选池已落地；gbi_online:0 逼近完成）
+> 更新时间：2026-09-03 15:40 UTC（benchmark 批次近尾声：qmp/gbi_online ~COMPLETED，gbi 81%，guide 89%，qmp_online 86%；**R1 根因确诊 + P0.1 跨任务候选池已落地**；Phase A 就绪）
 > 关联文档：[GbI.md](GbI.md)（设计）、[GbI_Experiment_Guide.md](GbI_Experiment_Guide.md)（复现指南）、[GbI_Improvement_Proposals.md](GbI_Improvement_Proposals.md)（根因诊断 × 文献借鉴 × v6 改进路线，09-03 新增）
 
 ## 摘要
@@ -8,7 +8,7 @@
 | 阶段 | 状态 | 说明 |
 |------|------|------|
 | state_sac 候选快照池 (500k) | ⚠️ 快照可用，**成功率记录全废** | 10 个候选快照齐全（eval.log 仅 episode_reward 有效：均值 8.5→34.6@50k→77@500k；**success 恒 0——#6 bug 受害者，先前文档“8.5→85”实为 reward 均值，成功率从未被正确记录**）；决策场复测已用修复后代码重测 10 ckpt（见 §四） |
-| benchmark 批次（09-02 08:06 启动，PARALLEL=1 并行 4 stage） | 🟢 **进行中（09-03 07:00）** | `qmp:0` ✅ 300k 完成（末期成功率 **0.60**，280k 点 7/10 任务 ≥50%，reward 91.1 超 indep 基线 400k 的 81.4）；`gbi_online:0` 298.6k（99.5%，**即将完成，完成后 `guide:0` CTPG 基线自动补位**）；`gbi:0` 179.8k（60%）；`qmp_online:0` 101.2k（34%，100k 点 success 升至 0.25）；无 NaN/崩溃，ES_ok 全 True（详见 §二批次节） |
+| benchmark 批次（09-02 08:06 启动，PARALLEL=1 并行 4 stage） | 🟢 **近尾声（09-03 15:40）** | `qmp:0` ✅ 299.8k（末期成功率 **0.60**，reward 91.1 超 indep 基线 400k 的 81.4）；`gbi_online:0` 299.8k（~COMPLETED，success 0.22@280k）；`gbi:0` 243.2k（81%，**success 0.51@240k 持续爬升**）；`guide:0` 267.4k（89%，success 0.35@260k）；`qmp_online:0` 258.2k（86%，success 0.34@240k）；无 NaN/崩溃（详见 §二批次节） |
 | 批次核心发现 | 🔴 **R1 根因确诊（代码级证据）** | **QMP（λ≡0）全面强于 GbI 是候选池实现偏离设计的必然后果，不是方法失败**：候选池被实现为"同一训练轨迹的时间快照"（执行仍用任务 i 自己的 head，arbiter.py:73-108），而 GbI.md §2.1 与 CTPG 的候选池都是跨任务策略 → 候选间真实差异≈0 → κ_t 全噪声 → λ_t 归零（100k–137k 实测）→ GbI 退化成"迟钝版 QMP"（触发率 5–6% vs QMP 68%）。三根因 R1/R2/R3 证据链见 [GbI_Improvement_Proposals.md §2](GbI_Improvement_Proposals.md) |
 | P0.1 跨任务候选池 | ✅ **已实现 + 验证（09-03）** | 候选 = 现役 actor 的 N 个任务 head（CTPG 同池语义），`cross_task_candidates.enabled` 开关，默认 False（现有 arm 行为逐位不变）；单元测试 20/20（含 legacy 回归）、py_compile、hydra 1.0.5 组装、启动脚本护栏全部通过；`scripts/run_cross_benchmark.sh` 就绪（Phase A 三臂 + SMOKE 模式 + 运行中批次检测，实测正确拒绝启动） |
 | 高危 #7 actor 冻结 | ✅ **已修复** | Candidate 加 freeze 参数，own 传 freeze=False；单元验证通过 |
@@ -53,15 +53,21 @@ QMP 对照实验 (300k, λ≡0 消融)
 
 > 编排：`xargs -P 3`（RUN_STAGES=`gbi:0 qmp:0 gbi_online:0 qmp_online:0 guide:0`），监控循环每 30 min 采样（`experiments/monitor/`）。历史注记：08-31 首批 GbI/QMP 因高危 #7 actor 冻结白跑（已归档 `legacy_20260902/`），本批为修复后重跑。
 
-| stage | 配置 | 状态（09-03 07:00） | 关键结果 |
+| stage | 配置 | 状态（09-03 15:40） | 关键结果 |
 |---|---|---|---|
-| `qmp:0` | λ≡0 / always / 快照池 | ✅ **COMPLETED**（09-03 02:01） | 成功率曲线 0.04→0.60（280k）；末期 reward 91.1 **超 indep 基线 400k 的 81.4**；7/10 任务 ≥50% |
-| `gbi_online:0` | gbi / adaptive / 在线池 | 298.6k / 300k（99.5%，**即将 COMPLETED**） | 0.22（280k，260k 点曾达 0.25）；步速 ~12k/h |
-| `gbi:0` | gbi / adaptive / 快照池 | 179.8k / 300k（60%） | 0.29（160k）；步速 ~7.8k/h（三路抢卡） |
-| `qmp_online:0` | qmp / always / 在线池 | 101.2k / 300k（34%） | 0.25（100k，20k–100k 快速爬升 0.05→0.25）；步速 ~20k/h |
-| `guide:0` | CTPG guide_mhsac | 排队（gbi_online 完成后自动补位） | — |
+| `qmp:0` | λ≡0 / always / 快照池 | ✅ **~COMPLETED**（299.8k） | 成功率曲线 0.04→0.60（280k）；末期 reward 91.1 **超 indep 基线 400k 的 81.4**；7/10 任务 ≥50% |
+| `gbi_online:0` | gbi / adaptive / 在线池 | ✅ **~COMPLETED**（299.8k） | 0.22（280k）；λ_t≈0.072 微弱非零；步速 ~12k/h |
+| `guide:0` | CTPG guide_mhsac | 267.4k / 300k（89%） | 0.35（260k）；reward 65.7，稳步爬升中 |
+| `gbi:0` | gbi / adaptive / 快照池 | 243.2k / 300k（81%） | **0.51（240k）**；reward 80.0；λ_t≈0.053 微弱非零；步速 ~7.8k/h |
+| `qmp_online:0` | qmp / always / 在线池 | 258.2k / 300k（86%） | 0.34（240k）；entropy 1.05 偏低（观察项）；步速 ~20k/h |
 
-**批次解读（详见 [GbI_Improvement_Proposals.md](GbI_Improvement_Proposals.md)）**：QMP 反超 GbI 的差距在 100k 步后稳定存在，且 λ_t 在 100k–137k 精确归零、κ_t 为负（-0.003~-0.055）——机制按设计"安全退化"，但退化根源是候选池空场（R1）+ 校准标签噪声（R2），非想象通道本身被证伪。触发模式混杂（gbi=adaptive 5–6% 触发率 vs qmp=always 68%）是 R3 混杂变量，Phase A 用 `gbi_cross_fast`（gbi+always）解耦。
+**批次解读（详见 [GbI_Improvement_Proposals.md](GbI_Improvement_Proposals.md)）**：
+
+1. **QMP 仍然最强**（0.60@280k），但 GbI 快照池版也在稳步学习（0.51@240k），差距在收窄（160k 时 gbi=0.29 vs qmp=0.42；240k 时 gbi=0.51 vs qmp=0.53）。
+2. **λ_t 微弱非零**（gbi≈0.053、gbi_online≈0.072），相比此前精确归零已有改善，但仍远不足以主导裁决——R1（候选池结构偏离）仍是主因。
+3. **触发率差异依旧**：gbi=adaptive 6% vs qmp=always 68%（R3 混杂），Phase A 的 `gbi_cross_fast`（gbi+always）将解耦此变量。
+4. **Guide（CTPG）基线稳步爬升**（0.35@260k），表现介于 gbi_online 与 gbi 之间——CTPG 的 learned guide 在 300k 预算内不如 QMP 的零模型裁决。
+5. **qmp_online entropy 偏低**（1.05 vs qmp 的 2.06），可能因在线候选池多样性不足导致过早收敛，列为观察项。
 
 **数据注意事项**：
 - `reports/benchmark_report.md` 为 09-02 01:10 基于已归档白跑数据的过期报告，批次结束后须重跑 `analyze_results.py`；
@@ -160,24 +166,26 @@ self.candidates: List[Candidate] = [
 - `adapt_reward_head` 的 before-loss 只取 head[0]，更新用 5 头均值，诊断口径不一致
 - 衔接脚本 `pgrep -f "main.py.*setup.alg=gbi_sac"` 已规避 QMP 误匹配（QMP 用 `setup.alg=qmp`），但多 seed 并行时仍可能互相干扰
 
-### GbI reward 现状（2026-09-02 分析）
+### GbI reward 现状（2026-09-03 更新，修复 #7 后重跑）
 
-**核心结论：GbI 300k 步评估零学习（eval 全程平线），同代码同任务的 state_sac 学习正常。**
+**核心结论：GbI 300k 步修复后学习正常（9.0→80.0@240k），但仍弱于 QMP（91.1@280k）。**
 
-| 实验 | eval reward（step 0 → 300k） | 备注 |
-|------|------------------------------|------|
-| state_sac_indep | 8.5 → **74.3**（300k）→ 85.0（500k） | 同代码同任务，学习正常（8.5→34.6@50k） |
-| GbI | 9.0 → **9.2**（全程 8.6~9.6 平线） | own 策略无学习迹象 |
+| 实验 | eval reward（step 0 → 最新） | eval success | 备注 |
+|------|------------------------------|--------------|------|
+| state_sac_indep | 8.5 → **85.0**（500k） | (恒 0，#6) | 同代码同任务，学习正常 |
+| QMP（快照池） | 9.0 → **91.1**（280k） | **0.600** | λ≡0 + always，最强 |
+| GbI（快照池） | 9.0 → **80.0**（240k） | **0.510** | 学习正常，差距收窄 |
+| Guide（CTPG） | 9.0 → **65.7**（260k） | 0.350 | learned guide，稳步爬升 |
+| QMP（在线池） | 9.0 → **62.6**（240k） | 0.340 | 在线池多样性不足 |
+| GbI（在线池） | 9.0 → **53.8**（280k） | 0.220 | λ_t 微弱非零 |
 
-关键观察（均来自 seed0 实测日志）：
+关键观察（均来自 seed0 实测日志，修复 #7 后重跑数据）：
 
 - **eval 只测裸 own 策略**：`act(sample=False)` 不走仲裁（gbi_sac.py 设计如此），而 GbI 的产品是"own + 仲裁"整体，当前评估口径只反映 own；
-- **λ_t 自 50k 步后恒为 0**：想象增益通道全程失效（κ_t≤0 被校准门关闭），后 25 万步实际以纯 QMP（Q 锚）运行——GbI 的"想象裁决"未被真正检验；
-- **alpha 塌缩**：GbI α→1.8e-9——**根因确认即高危 #7**（actor 冻结→熵恒 5.68>target −4→α 被持续压到浮点下界；QMP α=0.00425 为塌缩进行时，此前“0.025 正常”系误判）；
-- **train reward 异常**：push(task5) 呈 0.1↔178 周期震荡（GbI 特有；state_sac/QMP 稳定 ~180）；其余任务 train reward 全程基本不变（reach ~26、peg-insert ~0.5），与 eval 平线一致；
-- **最终 eval 各任务**（step 280k）：reach 25.2 / drawer-open 21.1 / window-close 12.3 / door-open 10.3 / drawer-close 7.0 / window-open 7.1 / button-press 7.2 / push 7.0 / pick-place 0.33 / peg-insert 0.48；
-- ~~**待查假设**：own 策略为何学不动~~ **根因已实锤（09-02 二轮审查）**：高危 #7 own 候选冻结现役 actor。四大异常（熵恒 5.68 / α 塌缩 / eval 平线 / 动作不变）全部由同一根因解释，与候选执行占比无关；
-- 附注：λ_t=50k 后恒 0 需待 #7 修复重跑后再评估（twohot #8 口径问题仍会压低想象打分质量）。
+- **λ_t 微弱非零**（09-03 更新）：gbi≈0.053、gbi_online≈0.072，相比此前精确归零已改善，但想象通道仍未主导裁决——R1 候选池结构偏离是主因；
+- **alpha 正常收缩**：修复 #7 后 α_0 正常收缩（gbi≈0.037、qmp≈0.017），不再塌缩到浮点下界；
+- **GbI 稳步学习**：eval reward 9.0→80.0@240k，success 0.04→0.51@240k——与旧版“全程平线”完全相反，证明 #7 修复有效；
+- **最终 eval 各任务**（gbi step 240k）：push **179.9** / window-close **139.9** / window-open **109.2** / drawer-close **54.6** / reach **25.3** / button-press **46.8** / door-open **61.7** / drawer-open **9.7** / peg-insert **0.3** / pick-place **0.1**；
 
 ---
 
@@ -330,17 +338,35 @@ self.candidates: List[Candidate] = [
 
 ---
 
-## 六、当前系统状态（2026-09-03 07:00 UTC）
+## 六、当前系统状态（2026-09-03 15:40 UTC）
 
 | 项 | 状态 |
 |----|------|
 | GPU | T4 100% 利用率，~1.5 GB / 15 GB 显存（算力瓶颈非显存） |
-| 训练进程 | 3 个：`gbi:0`（179.8k）、`gbi_online:0`（298.6k，即将完成）、`qmp_online:0`（101.2k）；`qmp:0` 已完成 |
-| 编排器 | `run_full_benchmark.sh` xargs -P 3 存活（PID 103510）；`guide:0` 将在 gbi_online COMPLETED 后自动补位 |
-| 监控 | 30 min 循环存活（`experiments/monitor/`，samples.jsonl 45+ 条，最新 06:38 无警告） |
+| 训练进程 | 3 个运行中：`gbi:0`（243.2k，81%）、`guide:0`（267.4k，89%）、`qmp_online:0`（258.2k，86%）；`qmp:0` 与 `gbi_online:0` 已近 300k |
+| 编排器 | `run_full_benchmark.sh` xargs -P 3 存活（PID 103510）；guide:0 已自动补位运行中 |
+| 监控 | 30 min 循环存活（`experiments/monitor/`，samples.jsonl 60+ 条，最新 15:38 无警告） |
 | 候选快照 | 11 个 actor（含 actor_0），10 个候选齐全 |
 | P0.1 代码 | 已落盘（默认关闭）；运行中进程不受影响（模块已加载进内存） |
-| 预计全批次完成 | gbi_online ~07:10；guide:0 补位后三路抢卡：qmp_online ~21:00±2h、gbi ~22:00±2h（ETA 偏保守） |
+| 预计全批次完成 | qmp_online/gbi/guide 约 09-03 18:00–22:00 陆续结束 |
+
+### 批次完整对比表（最新 eval 点，09-03 15:40 UTC）
+
+| 算法 | eval@step | reward | success | entropy | λ_t | 触发率 | 换手率 |
+|------|-----------|--------|---------|---------|-----|--------|--------|
+| **qmp**（快照池，λ≡0，always） | 280k | **91.1** | **0.600** | 2.06 | 0.0 | 68.3% | 31.2% |
+| **gbi**（快照池，adaptive） | 240k | 80.0 | 0.510 | 1.82 | 0.053 | 6.2% | 0.4% |
+| **guide**（CTPG MHSAC） | 260k | 65.7 | 0.350 | 1.54 | — | — | — |
+| **qmp_online**（在线池，always） | 240k | 62.6 | 0.340 | **1.05** | 0.0 | 76.0% | 24.0% |
+| **gbi_online**（在线池，adaptive） | 280k | 53.8 | 0.220 | 2.06 | 0.072 | 6.9% | 0.3% |
+| **indep**（state_sac 基线） | 500k | 85.0 | (恒 0，#6) | — | — | — | — |
+
+**关键发现**：
+- QMP > GbI > Guide > QMP_online > GBI_online（按 reward/success 排序）
+- GbI 修复 #7 后学习正常（9.0→80.0@240k），但仍弱于 QMP——R1 根因的结构性限制
+- 裁决框架本身有效：QMP 的 91.1 超过 indep 500k 的 85.0（尽管 indep success 不可比）
+- 在线池整体弱于快照池——候选多样性不足（在线池仅 4 个近期快照 vs 快照池 10 个跨 50k–500k）
+- Guide（CTPG）在 300k 预算内不敌纯 Q 锚裁决（0.35 vs 0.60），但仍在爬升中
 
 ---
 
@@ -350,14 +376,14 @@ self.candidates: List[Candidate] = [
 2. ~~修复高危 #7 / #6 / 中危 #8~~ ✅ 均已修复并验证
 3. ~~冒烟验收~~ ✅ 已通过（09-02 06:00，熵下降/α 收缩/ES_i=200 全部反转白跑铁证）
 4. ~~Phase 0 决策场复测~~ ✅ 已通过（09-02）
-5. ~~重启全量流水线~~ 🟢 **进行中**：benchmark 批次 09-02 08:06 启动（qmp:0 已完成；gbi_online:0 逼近 300k；gbi:0 60%；qmp_online:0 34%；guide:0 排队补位）
+5. ~~重启全量流水线~~ 🟢 **近尾声**：benchmark 批次 09-02 08:06 启动（qmp:0 ~COMPLETED；gbi_online:0 ~COMPLETED；guide:0 89%；gbi:0 81%；qmp_online:0 86%）
 6. ~~R1 根因诊断~~ ✅ **已确诊（09-03）**：候选池实现偏离设计（时间快照 ≠ 跨任务策略）+ R2 校准标签非配对 + R3 触发模式混杂，证据链见 [GbI_Improvement_Proposals.md §2](GbI_Improvement_Proposals.md)
 7. ~~P0.1 跨任务候选池实现~~ ✅ **已落地并验证（09-03）**：`cross_task_candidates.enabled` 开关 + `run_cross_benchmark.sh`，单元测试 20/20（含 legacy 回归）
-8. **批次结束后的 Phase A**（gbi_online 完成后 guide 自动补位，全部结束后）：
+8. **批次结束后的 Phase A**（全部 COMPLETED 后，预计 09-03 22:00 前后）：
    - `SMOKE=1 bash scripts/run_cross_benchmark.sh`（3000 步冒烟，验收口径：池构建日志 / gain 分布非退化 / κ_t 信噪比 / SWR>0 / 无 NaN）
    - 通过后正式三臂（`gbi_cross` / `qmp_cross` / `gbi_cross_fast`，300k，PARALLEL=1 MAX_PARALLEL=3）
    - go/no-go：跨任务决策场 gap 中位数 >0.1；gbi_cross 的 λ_t 不再长区间归零；gbi_cross ≥ qmp_cross 且 ≥ guide
-9. **批次完成后分析**：重跑 `analyze_results.py`（当前 reports/ 为过期白跑数据）；对比 gbi vs qmp 的 train.log / eval.log / `gbi_source_*.npz`；qmp_online 熵偏低（0.77）列为观察项
+9. **批次完成后分析**：重跑 `analyze_results.py`（当前 reports/ 为过期白跑数据）；对比各 arm 的 train.log / eval.log / `gbi_source_*.npz`；qmp_online entropy 偏低（1.05）列为观察项
 10. **多 seed**：Phase B 起 ≥3 seeds（当前批 n=1 只报效应量）
 
 ---
