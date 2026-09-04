@@ -27,11 +27,23 @@ gbi:
   m_low: 3
   fixed_K: 10
   calibrate_window: 500
+  # 护栏开关：此前只在 Arbiter.__init__ 里有默认值、无法从配置覆盖，
+  # GbI.md §5.3 要求的护栏消融因此必须改代码；现全部暴露为配置项。
+  guardrail_reject: True
+  switch_requires_positive_gain: True
+  # G3：正增益换手门仅在 λ_t>0（想象通道被校准门认可）时生效 →
+  # λ_t=0 时严格退化为 QMP，兑现 GbI.md §3.2「κ_t≤0 平滑退化为纯 QMP」的设计声明；
+  # 置 False 恢复旧行为（门与 λ_t 无关、始终生效 → 实际退化为纯 own 策略）。
+  gain_gate_requires_trust: True
   # 世界模型训练 + TTA
   wm_update_every: 1
   wm_batch_size: 1024
   tta_enabled: True
   tta_recent_n: 5
+  # G6：eval 是否走「贪婪仲裁」（每步 argmax_j S_j 的均值动作）。
+  # 默认 False = 历史行为（eval 只测裸 own 策略，与 CTPG 基线可比）；
+  # 置 True 才能测到 GbI 的产品「own + 仲裁」整体。建议正式 arm 两个口径都跑。
+  eval_with_arbiter: False
   # 候选快照池（Phase 0/M3：state_sac 训练快照的 model_dir 与 step 列表）
   candidates_dir: null
   candidate_steps: []

@@ -45,20 +45,45 @@ class TwoHotSymlog:
         assert reward_bins >= 3, "two-hot 需要至少 3 个分箱"
         assert reward_min < reward_max
         self.reward_bins = reward_bins
-        self.reward_min = float(reward_min)
-        self.reward_max = float(reward_max)
-        self.low = symlog(torch.tensor(self.reward_min, dtype=torch.float32)).item()
-        self.high = symlog(torch.tensor(self.reward_max, dtype=torch.float32)).item()
+        # 按 device 缓存 bin_centers，避免打分热路径上每次调用都做一次
+        # host→device 拷贝（每个 env step 会调用 N候选×H步 次）。
+        self._dev_cache: dict = {}
+        self.set_range(reward_min, reward_max)
+    
+    def set_range(self, reward_min: float, reward_max: float) -> None:
+        """重设原始奖励空间上下界并重建分箱。
+    
+        分箱必须在 symlog 空间均匀铺开，且上下界要覆盖真实奖励分布：
+        若上界远大于实际奖励（如 ±400 vs 实际 ±0.32），绝大部分 bin 被浪费，
+        奖励头的分辨率（也就是裁决器需要的排序能力）直接崩。
+        """
+        reward_min = float(reward_min)
+        reward_max = float(reward_max)
+        assert reward_min < reward_max
+        self.reward_min = reward_min
+        self.reward_max = reward_max
+        self.low = symlog(torch.tensor(reward_min, dtype=torch.float32)).item()
+        self.high = symlog(torch.tensor(reward_max, dtype=torch.float32)).item()
         # (bins,) 分箱中心，symlog 空间
         self.register_bins()
-
+    
     def register_bins(self) -> None:
         centers = torch.linspace(self.low, self.high, self.reward_bins)
         self.register_buffer("bin_centers", centers)  # symlog 空间
         # symexp 回原始奖励空间（打分/偏置表反解用）
         self.register_buffer("bin_centers_raw", symexp(centers))
-
-    # ---- 与 nn.Module.splitter 一致的注册接口（组件内部持有，非独立 module） ----
+        self._dev_cache.clear()
+    
+    def bins_to(self, device) -> TensorType:
+        """取已缓存在目标 device 上的 bin_centers（symlog 空间）。"""
+        key = str(device)
+        cached = self._dev_cache.get(key)
+        if cached is None:
+            cached = self.bin_centers.to(device)
+            self._dev_cache[key] = cached
+        return cached
+    
+    # ---- 与 nn.Module.splitter 一致的注册接口（组件内部持有，非独立 module）----
     def register_buffer(self, name: str, tensor: TensorType) -> None:
         self.__dict__[name] = tensor
 
@@ -74,7 +99,7 @@ def twohot_label(
     其余分箱概率为 0，行和为 1。
     """
     y = symlog(reward.float())  # (B, 1)
-    centers = twohot.bin_centers.to(device)  # (bins,)
+    centers = twohot.bins_to(reward.device)  # (bins,)
     # 用上界式编码: 把 y 映射到 [0, bins-1] 标尺上
     span = centers[-1] - centers[0]
     offset = (y - centers[0]).clamp(min=0.0, max=span)  # (B, 1) 非负
@@ -107,7 +132,7 @@ def bins_to_reward(logits: TensorType, twohot: TwoHotSymlog) -> TensorType:
     （中危 #8，2026-09-02 修复）。
     """
     probs = torch.softmax(logits, dim=-1)  # (..., bins)
-    y = (probs * twohot.bin_centers.to(logits.device)).sum(dim=-1)
+    y = (probs * twohot.bins_to(logits.device)).sum(dim=-1)
     return symexp(y)
 
 

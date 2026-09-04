@@ -26,7 +26,7 @@ cd "$REPO_ROOT"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 export PYTHONPATH="$REPO_ROOT"
 
-RUNS_ROOT="/root/rivermind-data/lost+found/gbi/experiments/runs"
+RUNS_ROOT="${RUNS_ROOT:-/root/rivermind-data/lost+found/gbi/experiments/runs}"
 REPORT_DIR="$RUNS_ROOT/../reports"
 mkdir -p "$REPORT_DIR"
 
@@ -36,7 +36,9 @@ STAGES="${RUN_STAGES:-$DEFAULT_STAGES}"
 if [ "${SMOKE:-0}" = "1" ]; then
     NUM_STEPS=3000 EVAL_FREQ=1000 SAVE_FREQ=3000
 else
-    NUM_STEPS=300000 EVAL_FREQ=20000 SAVE_FREQ=20000
+    # 2026-09-03：步数/评估频率/保存频率支持环境变量覆盖（默认与文档一致），
+    # 便于在新机做缩短预算的关键流程验证（例如 NUM_STEPS=60100 EVAL_FREQ=10000）。
+    NUM_STEPS="${NUM_STEPS:-300000}" EVAL_FREQ="${EVAL_FREQ:-20000}" SAVE_FREQ="${SAVE_FREQ:-20000}"
 fi
 
 COMMON=(

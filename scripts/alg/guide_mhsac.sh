@@ -15,7 +15,7 @@ env_name="$env-$map"
 
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-RUN_BASE="/root/rivermind-data/lost+found/gbi/experiments/runs/guide"
+RUN_BASE="${GBI_RUN_BASE:-/root/rivermind-data/lost+found/gbi/experiments/runs/guide}"
 RUN_DIR="${RUN_BASE}/${map}/seed${seed}"
 mkdir -p "$RUN_DIR"
 

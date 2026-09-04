@@ -3,9 +3,29 @@
 _target_: mtrl.agent.components.world_model.WorldModel
 hidden_dim: 512
 num_heads: 5
-reward_bins: 101
-reward_min: -400.0
-reward_max: 400.0
+# 101 → 255（DreamerV3 默认）：±2 区间下 bin 间距 0.0220 → 0.0055，
+# 早期奖励（p99.5≈0.16）可用 bin 从 8 个提到 ~28 个，策略变强后（~1.0/步）
+# 可达 ~127 个；代价仅每个奖励头输出层 101→255 单元（5 头共 +20 万参数）。
+reward_bins: 255
+# reward_min/max 现在只是「首次自动校准前」的兜底区间。
+# 旧值 ±400 与实际奖励尺度差 3 个数量级：env 配置带 ScaleRewardWrapper(reward_scale=0.1)，
+# 实测 MT10 逐步奖励 min=0 / max=0.32 / mean=0.0445，±400 下 101 bin 只用到 3 个、
+# 量化相对误差 60%（诊断脚本 gbi_out/setup/diag_twohot_tta.py 实测）。
+# 兜底值改为 ±2，可覆盖 scale=0.1 后各 benchmark 的逐步奖励（含策略变强后的上涨）。
+reward_min: -2.0
+reward_max: 2.0
+# 分箱范围自适应：首次残差缓存刷新时用任务均衡样本的 |r| 分位数一次性校准，
+# 之后仅在真实奖励突破范围时按 expand_factor 扩容（优于饱和截断）。
+reward_range_auto: True
+reward_range_q: 0.995
+# margin 与 floor 共同决定 absmax = max(p_q(|r|)*margin, floor)。
+# margin 过大则 bin 浪费（实测 margin=10 时早期训练只用到 7.9% 的 bin）；
+# floor=2.0 对应 ScaleRewardWrapper(0.1) 下各 benchmark 逐步奖励的物理上界
+# （文档实测：push 单步最高 ~0.9），突破时由 expand_factor 兜底。
+reward_range_margin: 4.0
+reward_range_floor: 2.0
+reward_range_expand_factor: 4.0
+reward_range_min_samples: 512
 encoder_ema_tau: 0.995
 lr: 1e-4
 adapt_lr: 1e-5

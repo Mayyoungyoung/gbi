@@ -190,6 +190,14 @@ class Agent(SACAgent):
             m_low=int(self.gbi_cfg.get("m_low", 3)),
             fixed_K=int(self.gbi_cfg.get("fixed_K", 10)),
             calibrate_window=int(self.gbi_cfg.get("calibrate_window", 500)),
+            # G3/护栏：三个开关此前硬编码在 Arbiter 默认值里，无法做 §5.3 消融
+            guardrail_reject=bool(self.gbi_cfg.get("guardrail_reject", True)),
+            switch_requires_positive_gain=bool(
+                self.gbi_cfg.get("switch_requires_positive_gain", True)
+            ),
+            gain_gate_requires_trust=bool(
+                self.gbi_cfg.get("gain_gate_requires_trust", True)
+            ),
         )
 
         # ---- 执行段 / 标注 / 来源归档 状态 ----
@@ -264,10 +272,59 @@ class Agent(SACAgent):
         modes: List[str],
         sample: bool,
     ) -> np.ndarray:
-        """eval（sample=False）照旧用自身均值策略；训练分支走 gbi_sample。"""
-        if not sample or not bool(self.gbi_cfg.get("enabled", True)):
+        """eval（sample=False）默认用自身均值策略；训练分支走 gbi_sample。
+
+        G6：`agent.gbi.eval_with_arbiter=True` 时 eval 改走「贪婪仲裁」（每步取
+        S_j 的 argmax 候选的均值动作，不走执行段状态机、不污染训练统计）。
+        默认 False 以保持与历史批次/CTPG 基线的可比性（两者 eval 都只看 own）；
+        但 GbI 的产品是「own + 仲裁」整体，不开该项时 eval 数字根本测不到裁决器
+        （Experiment_Status 已自认“eval 只测裸 own 策略”，但一直未提供开关）。
+        """
+        if not bool(self.gbi_cfg.get("enabled", True)):
+            return super().act(multitask_obs=multitask_obs, modes=modes, sample=sample)
+        if not sample:
+            if bool(self.gbi_cfg.get("eval_with_arbiter", False)):
+                return self.gbi_eval_greedy(multitask_obs=multitask_obs)
             return super().act(multitask_obs=multitask_obs, modes=modes, sample=sample)
         return self.gbi_sample(multitask_obs=multitask_obs, modes=modes)
+
+    def gbi_eval_greedy(self, multitask_obs: ObsType) -> np.ndarray:
+        """贪婪仲裁 eval：每步 argmax_j S_j(s)，用被选候选的均值动作（无探索、无段状态）。
+
+        与 gbi_sample 的区别：不推进执行段/不写 U 滑窗/不记台账，因此对训练
+        零副作用；仲裁器诊断量在调用前后做快照保护，避免 eval batch 污染
+        train 窗口上报的决策场指标。
+        """
+        was_training = self.training
+        self.eval()
+        env_obs = multitask_obs["env_obs"]
+        env_index = multitask_obs["task_obs"].to(self.device, non_blocking=True)
+        diag_backup = dict(self.arbiter._diag)
+        with torch.no_grad():
+            obs = env_obs.float().to(self.device)
+            if len(obs.shape) == 1 or len(obs.shape) == 3:
+                obs = obs.unsqueeze(0)
+            obs = obs.reshape(obs.shape[0], -1)
+            B = obs.shape[0]
+            task_t = env_index.long().reshape(B, 1)
+            res = self.arbiter.score(obs, task_t)
+            chosen = res["chosen"].detach().cpu().numpy()
+            actions = np.zeros((B, self.action_shape[0]), dtype=np.float32)
+            for j in range(len(self.candidates)):
+                rows = np.flatnonzero(chosen == j)
+                if rows.size == 0:
+                    continue
+                idx = torch.as_tensor(rows, device=self.device, dtype=torch.long)
+                actions[rows] = (
+                    self.candidates[j]
+                    .mean_action(obs[idx], task_t[idx])
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+        self.arbiter._diag = diag_backup
+        self.train(was_training)
+        return actions
 
     def gbi_sample(
         self,

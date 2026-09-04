@@ -4,3 +4,11 @@ __pycache__/
 *.pyc
 tmp_obs_check.py
 *.log
+# 运行产物：scripts/alg/*.sh 与 run_*_benchmark.sh 把 RUN_BASE 硬编码在仓库内的
+# experiments/runs/（单个快照池就 305MB），但旧 .gitignore 未覆盖该目录 ——
+# GbI_Server_Migration.md §1 明确要求 run 数据不入 git，此前无任何机制兜住。
+experiments/
+gbi_out/
+# scripts/env_setup.sh 会往仓库根写 gpu_info.txt（*.log 已被忽略，txt 未覆盖）
+gpu_info.txt
+.pytest_cache/

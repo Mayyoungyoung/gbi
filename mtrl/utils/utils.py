@@ -60,25 +60,48 @@ def make_dir(path: str) -> str:
 def get_current_commit_id() -> str:
     """Get current commit id.
 
+    代码副本不在 git 工作树内时（例如从 GitHub 源码 zip 解压部署）原先会抛
+    CalledProcessError，导致 _process_setup_config 直接失败、程序无法启动。
+    现降级为返回 "unknown"，让非 git 部署也能跑通（GbI 修复 G1）。
+
     Returns:
-        str: current commit id.
+        str: current commit id, or "unknown" when not inside a git work tree.
     """
     command = "git rev-parse HEAD"
-    commit_id = (
-        subprocess.check_output(command.split()).strip().decode("utf-8")  # noqa: S603
-    )
+    try:
+        commit_id = (
+            subprocess.check_output(  # noqa: S603
+                command.split(), stderr=subprocess.DEVNULL
+            )
+            .strip()
+            .decode("utf-8")
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return "unknown"
     return commit_id
 
 
 def has_uncommitted_changes() -> bool:
     """Check if there are uncommited changes.
 
+    两处失效已修（GbI 修复 G1）：
+      1. 非 git 目录时 subprocess 抛异常 → 降级为 False；
+      2. 匹配串用的是 git 2.x 之前的措辞 "nothing to commit (working directory
+         clean)"，现代 git 输出 "nothing to commit, working tree clean"，导致
+         该函数在干净工作树上也恒返回 True（溯源标记恒为 dirty）。
+
     Returns:
         bool: wether there are uncommiteed changes.
     """
-    command = "git status"
-    output = subprocess.check_output(command.split()).strip().decode("utf-8")
-    return "nothing to commit (working directory clean)" not in output
+    command = "git status --porcelain"
+    try:
+        output = subprocess.check_output(  # noqa: S603
+            command.split(), stderr=subprocess.DEVNULL
+        ).strip().decode("utf-8")
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return False
+    # --porcelain：干净工作树输出为空，与 git 版本文案无关
+    return len(output) > 0
 
 
 def set_seed(seed: int) -> None:

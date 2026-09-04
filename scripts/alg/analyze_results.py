@@ -50,14 +50,22 @@ ALGS = {
     "qmp": ("qmp/metaworld/mt10/seed{seed}", "metaworld-mt10/qmp"),
     "indep": ("state_sac_indep/mt10/seed{seed}", "metaworld-mt10/state_sac"),
     "guide": ("guide/mt10/seed{seed}", "metaworld-mt10/guide_mhsac"),
+    # ---- Phase A 跨任务候选池臂（P0.1，run_cross_benchmark.sh 布局）----
+    "gbi_cross": ("gbi_cross/metaworld/mt10/seed{seed}", "metaworld-mt10/gbi_cross"),
+    "qmp_cross": ("qmp_cross/metaworld/mt10/seed{seed}", "metaworld-mt10/qmp_cross"),
+    "gbi_cross_fast": ("gbi_cross_fast/metaworld/mt10/seed{seed}", "metaworld-mt10/gbi_cross_fast"),
 }
 ALG_LABEL = {
     "gbi": "GbI 完整版",
     "qmp": "QMP 消融 (λ≡0)",
     "indep": "state_sac_indep",
     "guide": "CTPG guide_mhsac",
+    "gbi_cross": "GbI 跨任务池",
+    "qmp_cross": "QMP 跨任务池 (λ≡0)",
+    "gbi_cross_fast": "GbI 跨任务池+always",
 }
-ALG_COLOR = {"gbi": "tab:blue", "qmp": "tab:orange", "indep": "tab:green", "guide": "tab:red"}
+ALG_COLOR = {"gbi": "tab:blue", "qmp": "tab:orange", "indep": "tab:green", "guide": "tab:red",
+             "gbi_cross": "tab:purple", "qmp_cross": "tab:brown", "gbi_cross_fast": "tab:pink"}
 
 # train.log 中需要提取的仲裁/世界模型指标（key 前缀 + 输出标签）
 METRIC_KEYS = [
@@ -75,16 +83,56 @@ METRIC_KEYS = [
     ("WL", "wm_loss", "世界模型总损失"),
     ("WRL", "wm_reward_loss", "奖励头损失"),
     ("DMAE", "wm_dyn_obs_mae", "动力学 MAE"),
+    # ---- G2 奖励分箱健康度 + 决策场密度（2026-09-03 新增指标）----
+    ("RRK", "wm_reward_rank_corr", "奖励头排序保真度 Spearman"),
+    ("RABS", "wm_reward_absmax", "奖励分箱 absmax"),
+    ("RBU", "wm_reward_bin_utilization", "分箱利用率"),
+    ("REXP", "wm_reward_range_expansions", "分箱扩容次数"),
+    ("GAM", "arbiter/gain_abs_median", "|gain| 中位数（决策场密度）"),
+    ("GMM", "arbiter/gain_max_median", "每行 max_j gain 中位数"),
+    ("GPF", "arbiter/gain_pos_frac", "gain>0 占比"),
+    ("QSM", "arbiter/q_spread_median", "Q 锚极差中位数"),
 ]
 
 NUM_TASKS = 10
 
 
-def newest_run(run_base, subdir):
-    """(alg, seed) → 最新 run 目录；不存在返回 None。"""
+def _run_budget(run_dir):
+    """从 log.jsonl 的 metadata 中取 experiment.num_train_steps。"""
+    path = os.path.join(run_dir, "log.jsonl")
+    if not os.path.exists(path):
+        return None
+    try:
+        for line in open(path):
+            d = json.loads(line)
+            exp = d.get("experiment", {})
+            if exp is not None and exp.get("num_train_steps") is not None:
+                return int(exp["num_train_steps"])
+    except Exception:
+        return None
+    return None
+
+
+def newest_run(run_base, subdir, max_budget=None, min_budget=None):
+    """(alg, seed) → 最新 run 目录；不存在返回 None。
+
+    同一布局下可能存在多个批次（如 60k 短测与 300k 正式），目录名最新者
+    未必是目标批次——按 log.jsonl 里的训练预算过滤，避免新批次遮蔽旧批次
+    （2026-09-03 实测：60k 分析被刚启动的 300k run 遮蔽，indep/guide 的
+    eval.log 只剩 step=0 一行）。
+    """
     pattern = os.path.join(run_base, "logs", subdir, "*")
     dirs = sorted(glob.glob(pattern), reverse=True)
-    return dirs[0] if dirs else None
+    for d in dirs:
+        budget = _run_budget(d)
+        if budget is None:
+            continue
+        if max_budget is not None and budget > max_budget:
+            continue
+        if min_budget is not None and budget < min_budget:
+            continue
+        return d
+    return None
 
 
 def load_eval(run_dir):
@@ -222,6 +270,10 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     ap.add_argument("--root", default=RUNS_ROOT)
     ap.add_argument("--out", default="/root/rivermind-data/lost+found/gbi/experiments/reports/benchmark_report.md")
+    ap.add_argument("--max-budget", type=int, default=None,
+                    help="只分析 num_train_steps <= 该值的 run（用于短测批次分析，避免被长批次遮蔽）")
+    ap.add_argument("--min-budget", type=int, default=None,
+                    help="只分析 num_train_steps >= 该值的 run（用于正式批次分析）")
     args = ap.parse_args()
 
     lines = []
@@ -238,7 +290,8 @@ def main():
         eval_data[alg] = {}
         train_metrics[alg] = {}
         for seed in args.seeds:
-            run_dir = newest_run(os.path.join(args.root, sub_tpl.format(seed=seed)), log_sub)
+            run_dir = newest_run(os.path.join(args.root, sub_tpl.format(seed=seed)), log_sub,
+                                 max_budget=args.max_budget, min_budget=args.min_budget)
             if run_dir is None:
                 continue
             ev = load_eval(run_dir)
@@ -304,11 +357,15 @@ def main():
             continue
         mats = np.asarray([eval_data[alg][s]["per_task"][-3:] for s in seeds_done])
         task_mean[alg] = mats.mean(axis=(0, 1))
+    # GbI−QMP 列：优先跨任务池配对（Phase A），否则回退 legacy 配对
+    diff_pair = ("gbi_cross", "qmp_cross")
+    if task_mean["gbi_cross"] is None or task_mean["qmp_cross"] is None:
+        diff_pair = ("gbi", "qmp")
     for t in range(NUM_TASKS):
         vals = {a: (f"{task_mean[a][t]:.3f}" if task_mean[a] is not None else "PENDING") for a in ALGS}
         diff = ""
-        if task_mean["gbi"] is not None and task_mean["qmp"] is not None:
-            d = task_mean["gbi"][t] - task_mean["qmp"][t]
+        if task_mean[diff_pair[0]] is not None and task_mean[diff_pair[1]] is not None:
+            d = task_mean[diff_pair[0]][t] - task_mean[diff_pair[1]][t]
             diff = f"{d:+.3f}"
         add(f"| task {t} | " + " | ".join(vals[a] for a in ALGS) + f" | {diff} |")
     add("")
@@ -317,7 +374,8 @@ def main():
     add("## 3. 关键对比（配对，按 seed 对齐）")
     add("")
     sec_idx = 1
-    for name_a, name_b in [("gbi", "qmp"), ("gbi", "indep"), ("gbi", "guide")]:
+    for name_a, name_b in [("gbi_cross", "qmp_cross"), ("gbi_cross", "indep"),
+                            ("gbi_cross", "guide"), ("gbi", "qmp"), ("gbi", "indep"), ("gbi", "guide")]:
         ev_a, ev_b = eval_data[name_a], eval_data[name_b]
         common_seeds = sorted(set(ev_a) & set(ev_b))
         if not common_seeds:
@@ -346,7 +404,7 @@ def main():
     # ---------- 仲裁指标 ----------
     add("## 4. 仲裁/世界模型指标分析（train.log）")
     add("")
-    for alg in ["gbi", "qmp"]:
+    for alg in ["gbi_cross", "qmp_cross", "gbi_cross_fast", "gbi", "qmp"]:
         seeds_done = sorted(train_metrics[alg])
         if not seeds_done:
             continue
@@ -379,37 +437,52 @@ def main():
                 verdict = ("动力学良好" if m_all < 0.01 else "动力学偏差偏大")
             elif key == "ALB":
                 verdict = ("TTA 有效" if m_all > 0 and (m_late < m_all) else "—")
+            elif key == "RRK":
+                verdict = ("排序保真度良好" if m_late > 0.2 else "排序能力不足（奖励头不可用于裁决）")
+            elif key == "RABS":
+                verdict = ("分箱范围合理" if 0.5 < m_late < 8.0 else "分箱范围异常（过窄/过宽）")
+            elif key == "RBU":
+                verdict = ("分辨率可接受" if m_late > 0.05 else "bin 浪费严重")
+            elif key == "GAM":
+                verdict = ("决策场非退化" if m_all > 1e-3 else "决策场空（候选间无真实差异）")
+            elif key == "GMM":
+                verdict = ("gap 达标(>0.1)" if m_all > 0.1 else "gap 未达标(≤0.1)")
             add(f"| {label} | {m_all:.4f} | {m_late:.4f} | {verdict} |")
         add("")
 
     # ---------- 结论 ----------
     add("## 5. 结论：GbI 是否有效？")
     add("")
-    res_gq = paired_compare("gbi", "qmp", eval_data["gbi"], eval_data["qmp"],
-                            max_steps("gbi", "qmp", eval_data))
-    res_gi = paired_compare("gbi", "indep", eval_data["gbi"], eval_data["indep"],
-                            max_steps("gbi", "indep", eval_data))
+    # 优先用跨任务池配对（Phase A 设计口径），缺失时回退 legacy 快照池配对
+    if eval_data["gbi_cross"] and eval_data["qmp_cross"]:
+        pair_a, pair_b = "gbi_cross", "qmp_cross"
+    else:
+        pair_a, pair_b = "gbi", "qmp"
+    res_gq = paired_compare(pair_a, pair_b, eval_data[pair_a], eval_data[pair_b],
+                            max_steps(pair_a, pair_b, eval_data))
+    res_gi = paired_compare(pair_a, "indep", eval_data[pair_a], eval_data["indep"],
+                            max_steps(pair_a, "indep", eval_data))
     if res_gq is None:
-        add("- **裁决公式判定：PENDING**（GbI 或 QMP 数据尚未完成）")
+        add(f"- **裁决公式判定：PENDING**（{pair_a} 或 {pair_b} 数据尚未完成）")
     else:
         d, p = res_gq["diff_mean"], res_gq["p_value"]
         if d > 0.05 and (p is None or p < 0.05):
-            verdict = f"**想象增益项 λ_t·(Î_j−Î_i) 有效**：GbI 末期成功率高出 QMP {d:+.3f}"
+            verdict = f"**想象增益项 λ_t·(Î_j−Î_i) 有效**：{ALG_LABEL[pair_a]} 末期成功率高出 {ALG_LABEL[pair_b]} {d:+.3f}"
             if p is not None:
                 verdict += f"（配对 t 检验 p={p:.3f}）"
             verdict += "。"
         elif abs(d) <= 0.05:
-            verdict = (f"**想象增益项未发挥作用**：GbI 与 QMP 末期成功率差 {d:+.3f} "
+            verdict = (f"**想象增益项未发挥作用**：{ALG_LABEL[pair_a]} 与 {ALG_LABEL[pair_b]} 末期成功率差 {d:+.3f} "
                        f"（≤0.05 判定阈值），裁决主要由 Q 锚主导，λ_t·(Î_j−Î_i) 贡献微弱。")
         else:
-            verdict = (f"**想象增益项呈负贡献**：GbI 低于 QMP {d:+.3f}，想象打分干扰了 Q 锚裁决，"
+            verdict = (f"**想象增益项呈负贡献**：{ALG_LABEL[pair_a]} 低于 {ALG_LABEL[pair_b]} {d:+.3f}，想象打分干扰了 Q 锚裁决，"
                        f"需结合 λ_t 校准门与 U_score 护栏诊断。")
-        add(f"- **裁决公式判定（GbI vs QMP）**：{verdict}")
+        add(f"- **裁决公式判定（{pair_a} vs {pair_b}）**：{verdict}")
     if res_gi is None:
         add("- **与独立训练对比判定：PENDING**（indep 数据尚未完成）")
     else:
         d = res_gi["diff_mean"]
-        add(f"- **多任务裁决 vs 独立训练**：GbI 末期成功率与 state_sac_indep 差 {d:+.3f}"
+        add(f"- **多任务裁决 vs 独立训练**：{ALG_LABEL[pair_a]} 末期成功率与 state_sac_indep 差 {d:+.3f}"
             + ("，共享多任务框架 + 裁决优于独立训练。" if d > 0.05
                else ("，两者接近，裁决机制未带来整体提升。" if abs(d) <= 0.05
                      else "，多任务共享框架劣于独立训练，需排查负迁移。")))
@@ -429,7 +502,9 @@ def main():
         f.write("\n".join(lines))
     print(f"[analyze] 报告已写入 {args.out}")
     print(f"[analyze] gbi seeds: {sorted(eval_data['gbi'])} | qmp: {sorted(eval_data['qmp'])} | "
-          f"indep: {sorted(eval_data['indep'])} | guide: {sorted(eval_data['guide'])}")
+          f"indep: {sorted(eval_data['indep'])} | guide: {sorted(eval_data['guide'])} | "
+          f"gbi_cross: {sorted(eval_data['gbi_cross'])} | qmp_cross: {sorted(eval_data['qmp_cross'])} | "
+          f"gbi_cross_fast: {sorted(eval_data['gbi_cross_fast'])}")
 
 
 def max_steps(name_a, name_b, eval_data):

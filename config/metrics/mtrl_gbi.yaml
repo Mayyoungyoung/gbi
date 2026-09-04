@@ -46,12 +46,25 @@ train:
     [wm_residual_stream_reward_loss, WRS, float, average],
     [wm_grad_norm, WGN, float, average],
     [wm_dyn_obs_mae, DMAE, float, average],
+    # ---- 奖励分箱健康度（G2 修复：±400 硬钉导致 101 bin 只用 3 个）----
+    [wm_reward_absmax, RABS, float, average],
+    [wm_reward_bin_utilization, RBU, float, average],
+    [wm_reward_range_expansions, REXP, float, average],
+    # 奖励头排序保真度（GbI.md §5.1 验收口径“排序准”）——以前无法在线观测
+    [wm_reward_rank_corr, RRK, float, average],
     [arbiter/lambda_t, LT, float, average],
     [arbiter/kappa_t, KT, float, average],
     [arbiter/tau_on, TON, float, average],
     [arbiter/tau_reject, TREJ, float, average],
     [arbiter/u_window_len, UWL, int, average],
     [arbiter/calib_len, CLL, int, average],
+    # ---- 决策场密度（go/no-go 口径“gap 中位数 > 0.1 / gain 分布非退化”
+    #      此前无任何指标可观测，只能事后跑 eval_decision_field.py）----
+    [arbiter/gain_abs_median, GAM, float, average],
+    [arbiter/gain_max_median, GMM, float, average],
+    [arbiter/gain_pos_frac, GPF, float, average],
+    [arbiter/q_spread_median, QSM, float, average],
+    [arbiter/i_own_median, IOM, float, average],
     [gbi_trigger_rate, TGR, float, average],
     [gbi_switch_rate, SWR, float, average],
     [gbi_uscore_ema, UEM, float, average],

@@ -153,7 +153,9 @@ def _process_setup_config(config: ConfigType) -> ConfigType:
     log_time = time.strftime("%Y-%m-%d-%H-%M-%S",time.gmtime())
     setup_config.id = f"{config.env.name}/{config.setup.alg}/{log_time}_issue_{setup_config.git.commit_id}_seed_{setup_config.seed}"
 
-    if setup_config.git.has_uncommitted_changes == "":
+    # YAML 空值经 OmegaConf 解析为 None（而非 ""），原先的 == "" 判定永不成立，
+    # 导致每个 run 的 setup.git.has_uncommitted_changes 恒为 null（溯源信息丢失）。
+    if setup_config.git.has_uncommitted_changes in ("", None):
         setup_config.git.has_uncommitted_changes = utils.has_uncommitted_changes()
 
     if not setup_config.date:

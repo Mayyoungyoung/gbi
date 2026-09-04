@@ -21,7 +21,7 @@ env_name="$env-$map"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 # 结果落盘目录（计划 §7: experiments/runs/{alg}/{env}/{seed}）
-RUN_BASE="/root/rivermind-data/lost+found/gbi/experiments/runs/gbi"
+RUN_BASE="${GBI_RUN_BASE:-/root/rivermind-data/lost+found/gbi/experiments/runs/gbi}"
 RUN_DIR="${RUN_BASE}/${env}/${map}/seed${seed}"
 mkdir -p "$RUN_DIR"
 

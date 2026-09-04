@@ -81,6 +81,20 @@ class WorldModel(base_component.Component):
         residual_quantile: float = 0.8,  # quantile-sigmoid 拐点
         residual_temperature: float = 5.0,
         residual_max_weight: float = 5.0,  # 上限截断防异常重尾样本绑架
+        # ---- 奖励分箱范围自适应（GbI 修复 G2）----
+        # 旧行为：分箱硬钉在 reward_min/max=±400。但 MT10/MT50 与 HalfCheetah 的
+        # env 配置都带 ScaleRewardWrapper(reward_scale=0.1)，实测逐步奖励
+        # min=0 / max=0.32 / mean=0.0445（随机策略 2000 步），对应 symlog 区间
+        # 仅 [0, 0.28]，而 ±400 的 symlog 区间是 [-5.99, +5.99]、bin 间距 0.1199
+        # → 101 个 bin 只用到 3 个，量化相对误差 60%。奖励头根本无法分辨
+        # 0.03 与 0.05，裁决器所需的“排序能力”从源头就没了（WRL 平台、
+        # 想象增益是噪声 → κ_t≈0 → λ_t≈0 的上游根因）。
+        reward_range_auto: bool = True,
+        reward_range_q: float = 0.995,      # 用分位数而非 max，抵异常值
+        reward_range_margin: float = 4.0,   # 给策略变强后的奖励上涨留余量
+        reward_range_floor: float = 2.0,    # absmax 下限（原始奖励空间）
+        reward_range_expand_factor: float = 4.0,  # 饱和时扩容倍数
+        reward_range_min_samples: int = 512,
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__()
@@ -104,11 +118,26 @@ class WorldModel(base_component.Component):
         self.residual_quantile = residual_quantile
         self.residual_temperature = residual_temperature
         self.residual_max_weight = residual_max_weight
+        self.reward_range_auto = bool(reward_range_auto)
+        self.reward_range_q = float(reward_range_q)
+        self.reward_range_margin = float(reward_range_margin)
+        self.reward_range_floor = float(reward_range_floor)
+        self.reward_range_expand_factor = float(reward_range_expand_factor)
+        self.reward_range_min_samples = int(reward_range_min_samples)
+        self._reward_range_expansions = 0
+        self._reward_bin_utilization = 0.0
+        self._reward_rank_corr = 0.0
+        self._reward_range_calibrated = False
         self._step = 0
         self._last_cache_refresh = -1
 
         # 奖励空间 two-hot 变换
         self.twohot = TwoHotSymlog(reward_bins, reward_min, reward_max)
+        # 当前生效的原始奖励绝对上界：注册为 buffer 以便随 checkpoint 往返，
+        # 恢复时重建同一分箱布局（否则续跑会用不同 bin 解释已学到的 logits）。
+        self.register_buffer(
+            "reward_absmax", torch.tensor(float(reward_max), dtype=torch.float32)
+        )
 
         # ---- 共享动力学 ----
         self.encoder = nn.Sequential(
@@ -197,6 +226,84 @@ class WorldModel(base_component.Component):
         """(B, 1) 的 task id → (B, num_envs) one-hot。"""
         ids = task_ids.long().squeeze(-1).clamp(0, self.num_envs - 1)
         return self._task_onehot_eye.to(self.device)[ids]
+
+    # ------------------------------------------------------------------ #
+    # 奖励分箱范围自适应（GbI 修复 G2）
+    # ------------------------------------------------------------------ #
+    def _apply_reward_absmax(self, absmax: float) -> None:
+        """把生效的原始奖励绝对上界写入 twohot 分箱（对称区间 [-absmax, +absmax]）。"""
+        absmax = max(float(absmax), 1e-3)
+        self.reward_absmax.fill_(absmax)
+        self.twohot.set_range(-absmax, absmax)
+        self._reward_range_calibrated = True
+
+    def load_state_dict(self, *args, **kwargs):
+        out = super().load_state_dict(*args, **kwargs)
+        # checkpoint 里的 reward_absmax 决定分箱布局，必须同步回 twohot，
+        # 否则续跑会用默认 ±400 的 bin 去解释已学到的 logits。
+        self._apply_reward_absmax(float(self.reward_absmax.item()))
+        return out
+
+    @staticmethod
+    def _spearman(x: np.ndarray, y: np.ndarray) -> float:
+        """Spearman 秩相关（自实现，与 arbiter.spearman_rank 同口径；
+        不从 arbiter 导入以避免 world_model ↔ arbiter 循环引用）。"""
+        if x.size < 3 or np.std(x) < 1e-12 or np.std(y) < 1e-12:
+            return 0.0
+
+        def _rank(v):
+            order = np.argsort(v, kind="mergesort")
+            r = np.empty(len(v), dtype=np.float64)
+            r[order] = np.arange(len(v))
+            return r
+
+        rx, ry = _rank(x), _rank(y)
+        if np.std(rx) < 1e-12 or np.std(ry) < 1e-12:
+            return 0.0
+        return float(np.corrcoef(rx, ry)[0, 1])
+
+    @torch.no_grad()
+    def update_reward_range(self, rew: TensorType) -> None:
+        """首次校准 + 饱和扩容 + 分箱利用率诊断。
+
+        仅在残差缓存刷新时调用（每 cache_refresh_every 步一次，样本任务均衡），
+        成本可忽略。校准一次性完成；之后只在真实奖励突破当前范围时扩容
+        （扩容必然优于继续饱和截断：后者会把所有高奖励压成同一个 bin，
+        直接丢失裁决器最关心的高奖励区排序信息）。
+        """
+        r = rew.detach().float().reshape(-1).cpu().numpy()
+        if r.size < self.reward_range_min_samples:
+            return
+        bins = self.twohot.reward_bins
+        centers = self.twohot.bin_centers.numpy()
+        spacing = float(centers[-1] - centers[0]) / max(bins - 1, 1)
+        y = np.sign(r) * np.log1p(np.abs(r))
+        hit = np.clip(np.round((y - centers[0]) / spacing).astype(int), 0, bins - 1)
+        self._reward_bin_utilization = float(len(np.unique(hit))) / float(bins)
+
+        absmax = float(self.reward_absmax.item())
+        if self.reward_range_auto and not self._reward_range_calibrated:
+            q = float(np.quantile(np.abs(r), self.reward_range_q))
+            new_absmax = max(q * self.reward_range_margin, self.reward_range_floor, 1e-3)
+            self._apply_reward_absmax(new_absmax)
+            new_spacing = (
+                2.0 * float(symlog(torch.tensor(new_absmax)).item()) / max(bins - 1, 1)
+            )
+            print(
+                f"[wm] reward bins auto-calibrated: |r| p{self.reward_range_q * 100:.1f}={q:.4f} "
+                f"-> range [-{new_absmax:.3f}, +{new_absmax:.3f}], symlog bin spacing "
+                f"{spacing:.4f} -> {new_spacing:.4f}, bin utilization "
+                f"{self._reward_bin_utilization * 100:.1f}%"
+            )
+            return
+        if absmax > 0 and float(np.abs(r).max()) > 0.95 * absmax:
+            self._reward_range_expansions += 1
+            self._apply_reward_absmax(absmax * self.reward_range_expand_factor)
+            print(
+                f"[wm] reward range expanded (x{self.reward_range_expand_factor}) to "
+                f"\u00b1{float(self.reward_absmax.item()):.3f}: observed |r|max="
+                f"{float(np.abs(r).max()):.3f} vs old absmax={absmax:.3f}"
+            )
 
     def _update_obs_stats(self, obs: TensorType) -> None:
         """running mean/std（逐 batch 累积，不参与梯度）。"""
@@ -312,12 +419,22 @@ class WorldModel(base_component.Component):
         """
         batch = self._sample_from_buffer(buffer, self.cache_size, balanced=True)
         obs, act, rew, next_obs, task = self._unpack_batch(batch)
+        # 先校准/扩容奖励分箱，再用当前模型算残差（否则残差基于错误的量化口径）
+        self.update_reward_range(rew)
         self._update_obs_stats(obs)
         z = self.encode(obs)
         inp = torch.cat([z, act], dim=-1).unsqueeze(1)
         h = self.rnn(inp)[0].squeeze(1)
         r_pred = self._transition_stats(h, self._task_onehot(task))  # (B,)
         residual = (rew.squeeze(-1) - r_pred).abs()  # (B,)
+        # 排序保真度（GbI.md §5.1：「对奖励头的要求从绝对准降到排序准」）。
+        # 旧实现只有 CE 损失（WRL）可看，而 CE 在 bin 被浪费时会因为目标
+        # 几乎相同而“好看”（实测 R4-e：WRL 平台 0.44 但排序能力并未修好），
+        # 无法回答“裁决器能不能用”。这里把 Spearman(pred, true) 做成在线指标。
+        self._reward_rank_corr = self._spearman(
+            r_pred.detach().float().cpu().numpy(),
+            rew.squeeze(-1).detach().float().cpu().numpy(),
+        )
         self._fill_residual_cache(obs, act, rew, next_obs, task, residual)
 
     def _fill_residual_cache(
@@ -494,6 +611,12 @@ class WorldModel(base_component.Component):
             metrics[k] = float(v.detach().cpu())
         metrics["wm_loss"] = float(total.detach().cpu())
         metrics["wm_grad_norm"] = float(grad_norm.detach().cpu())
+        # 分箱健康度诊断（G2）：absmax / 利用率 / 扩容次数——直接对应
+        # “奖励头分辨率是否足够支撑排序”这个验收口径
+        metrics["reward_absmax"] = float(self.reward_absmax.item())
+        metrics["reward_bin_utilization"] = float(self._reward_bin_utilization)
+        metrics["reward_range_expansions"] = float(self._reward_range_expansions)
+        metrics["reward_rank_corr"] = float(self._reward_rank_corr)
 
         # 动力学 MAE 诊断（obs 空间，一步）
         with torch.no_grad():

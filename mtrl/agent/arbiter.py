@@ -149,6 +149,7 @@ class Arbiter:
         quantile_refresh_steps: int = 32,
         guardrail_reject: bool = True,
         switch_requires_positive_gain: bool = True,
+        gain_gate_requires_trust: bool = True,
     ):
         self.wm = world_model
         self.critic = critic
@@ -172,7 +173,17 @@ class Arbiter:
         self.quantile_refresh_steps = quantile_refresh_steps
         self.guardrail_reject = guardrail_reject
         self.switch_requires_positive_gain = switch_requires_positive_gain
+        # G3：正增益换手门是否只在想象通道被信任（λ_t>0）时生效（详见 score()）
+        self.gain_gate_requires_trust = bool(gain_gate_requires_trust)
         assert mode in ("gbi", "qmp", "imag")
+        # 决策场密度诊断（每次 score 刷新，由 metrics() 上报）
+        self._diag: Dict[str, float] = {
+            "arbiter/gain_abs_median": 0.0,
+            "arbiter/gain_max_median": 0.0,
+            "arbiter/gain_pos_frac": 0.0,
+            "arbiter/q_spread_median": 0.0,
+            "arbiter/i_own_median": 0.0,
+        }
 
         # γ^{τ-1} 权重：τ=1..H-1
         disc = torch.tensor(
@@ -225,26 +236,69 @@ class Arbiter:
     # ------------------------------------------------------------------ #
     # 打分核心
     # ------------------------------------------------------------------ #
+    def _shared_actor_pool(self, cands: List[Candidate]) -> bool:
+        """所有候选是否共享同一个 actor 对象（cross 池：N 个任务 head 同一网络）。
+        成立时可把「候选维」折进「batch 维」，一次前向算完所有候选。"""
+        return len(cands) > 1 and len({id(c.actor) for c in cands}) == 1
+
+    def _candidate_task_matrix(self, cands: List[Candidate], task_env: TensorType,
+                              B: int) -> TensorType:
+        """(B, N) 矩阵：第 (i, j) 元 = 候选 j 在行 i 上应用的任务 head id。
+        跨任务候选用自身 task_id；legacy 候选（task_id=None）沿用 env 任务 id。"""
+        cand_tid = torch.tensor(
+            [-1 if c.task_id is None else int(c.task_id) for c in cands],
+            dtype=torch.long, device=self.device,
+        ).view(1, len(cands))
+        env_tid = task_env.view(B, 1).expand(B, len(cands))
+        return torch.where(cand_tid >= 0, cand_tid.expand(B, len(cands)), env_tid)
+
     @torch.no_grad()
     def q_anchor(self, obs: TensorType, task_ids: TensorType,
                  candidates: Optional[List[Candidate]] = None) -> TensorType:
-        """Q 锚：Q_φi(s, π_j(s))，现役 critic（均值动作）。返回 (B, N)。"""
+        """Q 锚：Q_φi(s, π_j(s))，现役 critic（均值动作）。返回 (B, N)。
+
+        性能（G4）：旧实现对每个候选各做一次 actor 前向 + 一次 critic 前向
+        （N=10 → 20 次 batch=10 的小算子）。现把候选维折进 batch 维：
+        actor 共享时 1 次前向算完 (B*N) 行动作，critic 恒为 1 次 (B*N) 前向。
+        行布局为 row-major（行 i*N+j 对应 env i / 候选 j），数值与逐候选版一致。
+        """
         cands = candidates or self.candidates
         B = obs.shape[0]
-        cols = []
-        for c in cands:
-            a = c.mean_action(obs, task_ids)
-            task_t = task_ids.long().to(self.device).reshape(B, 1)
+        N = len(cands)
+        obs_d = obs.float().to(self.device)
+        task_env = task_ids.long().to(self.device).reshape(B, 1)
+        lo, hi = cands[0].action_range
+
+        # 1) 所有候选的均值动作 a_j = π_j(s)
+        if self._shared_actor_pool(cands):
+            tid_flat = self._candidate_task_matrix(cands, task_env, B).reshape(-1, 1)
+            obs_rep = obs_d.repeat_interleave(N, dim=0)          # (B*N, obs_dim)
             mtobs = MTObs(
-                env_obs=obs.float().to(self.device),
-                task_obs=task_t,
-                task_info=TaskInfo(encoding=None, compute_grad=False, env_index=task_t),
+                env_obs=obs_rep,
+                task_obs=tid_flat,
+                task_info=TaskInfo(encoding=None, compute_grad=False, env_index=tid_flat),
             )
-            q1, q2 = self.critic(mtobs=mtobs, action=a, detach_encoder=False)
-            # min 口径（2026-09-02）：与 SAC 值学习（target 用 min）一致，
-            # 防止打分高估；此前 (q1+q2)/2 会系统性偏高且偏向过乐观的候选
-            cols.append(torch.min(q1, q2).squeeze(-1))
-        return torch.stack(cols, dim=1)  # (B, N)
+            mu, _pi, _, _ = cands[0].actor(mtobs=mtobs)
+            acts = mu.clamp(lo, hi).reshape(B, N, -1)            # (B, N, act_dim)
+        else:
+            acts = torch.stack(
+                [c.mean_action(obs, task_ids) for c in cands], dim=1
+            )                                                    # (B, N, act_dim)
+
+        # 2) critic 条件始终是任务 i 自己的尺子（与候选无关）→ 可整体批量
+        obs_rep = obs_d.repeat_interleave(N, dim=0)              # (B*N, obs_dim)
+        task_rep = task_env.repeat_interleave(N, dim=0)          # (B*N, 1) = env 任务 i
+        mtobs = MTObs(
+            env_obs=obs_rep,
+            task_obs=task_rep,
+            task_info=TaskInfo(encoding=None, compute_grad=False, env_index=task_rep),
+        )
+        q1, q2 = self.critic(
+            mtobs=mtobs, action=acts.reshape(B * N, -1), detach_encoder=False
+        )
+        # min 口径（2026-09-02）：与 SAC 值学习（target 用 min）一致，
+        # 防止打分高估；此前 (q1+q2)/2 会系统性偏高且偏向过乐观的候选
+        return torch.min(q1, q2).reshape(B, N)
 
     @torch.no_grad()
     def imagine(
@@ -256,13 +310,46 @@ class Arbiter:
         """想象打分。返回：
         - I_mean: (B, N) 每候选 5 头均值打分 Î_j（Σ_{τ=1}^{H-1} γ^{τ-1} r̂_τ）
         - U: (B, N) 每候选 Var_k(Î^k_j) 评分层分歧
+
+        性能（G4）：cross 池下 N 个候选共享动力学与 actor，旧实现做 N 次
+        独立 close_loop_rollout（N×H×M ≈ 250 次小前向/env step，实测 173ms/步）。
+        现合并为一次 (B*N) 行的 rollout：动力学/奖励头条件逐行用 env 的任务 i，
+        动作闭包逐行用候选自己的 head j——与 GbI.md §4.5「想象 = 任务 j 的策略在
+        任务 i 的奖励场里展开」语义一致，世界模型侧零改动。
         """
         cands = candidates or self.candidates
         B = obs.shape[0]
+        N = len(cands)
+        obs_d = obs.float().to(self.device)
+        task_env = task_ids.long().to(self.device).reshape(B, 1)
+
+        if self._shared_actor_pool(cands):
+            tid_flat = self._candidate_task_matrix(cands, task_env, B).reshape(-1, 1)
+            obs_rep = obs_d.repeat_interleave(N, dim=0)          # (B*N, obs_dim)
+            env_tid_rep = task_env.repeat_interleave(N, dim=0)   # (B*N, 1) 奖励头条件=任务 i
+            actor = cands[0].actor
+            lo, hi = cands[0].action_range
+
+            def _act_batched(cur_obs):
+                mtobs = MTObs(
+                    env_obs=cur_obs,
+                    task_obs=tid_flat,
+                    task_info=TaskInfo(encoding=None, compute_grad=False, env_index=tid_flat),
+                )
+                mu, _pi, _, _ = actor(mtobs=mtobs)
+                return mu.clamp(lo, hi)
+
+            out = self.wm.close_loop_rollout(obs_rep, env_tid_rep, _act_batched, self.H)
+            rewards = out["rewards"][1:]                         # (H-1, M, B*N)
+            I_head = (rewards * self.discount.view(-1, 1, 1)).sum(0)   # (M, B*N)
+            I_mean = I_head.mean(0).reshape(B, N)
+            U = I_head.var(0).reshape(B, N)
+            return I_mean, U
+
         I_mean_list, U_list = [], []
         for c in cands:
-            def _act(cur_obs):
-                return c.mean_action(cur_obs, task_ids)
+            def _act(cur_obs, _c=c):
+                return _c.mean_action(cur_obs, task_ids)
             out = self.wm.close_loop_rollout(obs, task_ids, _act, self.H)
             # rewards: (H, M, B)；取 τ=1..H-1（公式 Σ_{τ=1}^{H-1}）
             rewards = out["rewards"][1:]  # (H-1, M, B)
@@ -312,15 +399,60 @@ class Arbiter:
         if self.guardrail_reject and self.mode != "qmp":
             reject_mask = u_trigger > self.tau_reject
             chosen = torch.where(reject_mask, own_idx, chosen)
-        # 换手要求相对增益 > 0
-        if self.switch_requires_positive_gain and self.mode == "gbi":
+        # 换手要求相对增益 > 0（§3.5 护栏②）。
+        # G3 修复：该门必须受信任度约束。设计 §3.2 声称「κ_t≤0 时系统平滑退化
+        # 为纯 QMP」，但原实现里该门与 λ_t 无关、始终生效：λ_t=0 时 S=Q，argmax Q
+        # 选中的候选只要想象增益≤0 就被打回 own，系统实际退化成「纯 own 策略」
+        # （比 QMP 更保守）——这正是 gbi 臂 SWR 仅 0.4% 而 qmp 臂 31.2% 的机制性原因，
+        # 也使「gbi(λ_t=0) ≡ qmp」的消融声明不成立。现改为：仅当 λ_t>0（想象通道
+        # 被校准门认可）时才用增益门否决换手；λ_t=0 时严格等价于 QMP。
+        if (
+            self.switch_requires_positive_gain
+            and self.mode == "gbi"
+            and (not self.gain_gate_requires_trust or self.lambda_t > 0.0)
+        ):
             gain_of_chosen = gain.gather(1, chosen.unsqueeze(1)).squeeze(-1)
             chosen = torch.where(gain_of_chosen > 0, chosen, own_idx)
+        self._update_decision_field_diag(Q, I_own, gain, own_idx)
         return {
             "S": S, "Q": Q, "I": I, "U": U,
             "chosen": chosen, "u_trigger": u_trigger, "gain": gain,
             "own_idx": own_idx,
         }
+
+    @torch.no_grad()
+    def _update_decision_field_diag(self, Q: TensorType, I_own: TensorType,
+                                    gain: TensorType, own_idx: TensorType) -> None:
+        """决策场密度诊断。
+
+        Phase A 的 go/no-go 口径明确要求「跨任务决策场 gap 中位数 > 0.1」与
+        「gain 分布非退化」，但原实现无任何在线指标可观测（只能事后跑
+        eval_decision_field.py 离线复测），跑完 300k 步才知道决策场是不是空的。
+        这里把四个关键量随 score() 顺带算出（纯 reduction，开销可忽略）。
+        """
+        N = gain.shape[1]
+        not_own = torch.ones_like(gain, dtype=torch.bool)
+        not_own.scatter_(1, own_idx.view(-1, 1), False)
+        g_off = gain[not_own] if N > 1 else gain.new_zeros(0)
+        if g_off.numel() > 0:
+            self._diag["arbiter/gain_abs_median"] = float(g_off.abs().median())
+            self._diag["arbiter/gain_pos_frac"] = float((g_off > 0).float().mean())
+            row_max = gain.masked_fill(~not_own, float("-inf")).max(dim=1).values
+            finite = row_max[torch.isfinite(row_max)]
+            self._diag["arbiter/gain_max_median"] = (
+                float(finite.median()) if finite.numel() > 0 else 0.0
+            )
+        else:
+            self._diag["arbiter/gain_abs_median"] = 0.0
+            self._diag["arbiter/gain_pos_frac"] = 0.0
+            self._diag["arbiter/gain_max_median"] = 0.0
+        q_spread = Q.max(dim=1).values - Q.min(dim=1).values
+        self._diag["arbiter/q_spread_median"] = (
+            float(q_spread.median()) if q_spread.numel() > 0 else 0.0
+        )
+        self._diag["arbiter/i_own_median"] = (
+            float(I_own.median()) if I_own.numel() > 0 else 0.0
+        )
 
     # ------------------------------------------------------------------ #
     # 触发 / 执行段状态机
@@ -440,7 +572,7 @@ class Arbiter:
     # 诊断
     # ------------------------------------------------------------------ #
     def metrics(self) -> Dict[str, float]:
-        return {
+        m = {
             "arbiter/lambda_t": self.lambda_t,
             "arbiter/kappa_t": self._kappa_t,
             "arbiter/tau_on": self.tau_on,
@@ -448,3 +580,11 @@ class Arbiter:
             "arbiter/u_window_len": len(self.u_window),
             "arbiter/calib_len": len(self.calib_deque),
         }
+        m.update(self._diag)
+        # G5：τ 的 warmup 哨兵是 +inf，而 Logger 的 AverageMeter 直接累加求均，
+        # 一个 inf 会把整个日志窗口的 tau_on/tau_reject 污染成 inf（实测冷启动
+        # 窗口 TON/TREJ 均为 inf，丢失全部信息）。未就绪时干脆不上报该键。
+        for key in ("arbiter/tau_on", "arbiter/tau_reject"):
+            if not np.isfinite(m[key]):
+                del m[key]
+        return m
